@@ -1,4 +1,5 @@
-# Bilibili 线程撕裂者
+# Bilibili 线程撕裂者 Firefox 兼容版
+注意到 Bilibili 线程撕裂者 以油猴脚本形式安装在 FireFox 上时有兼容性问题，故修改了此 firefox 原生插件版本
 
 ## 目录
 
@@ -13,7 +14,7 @@
 - [开发与构建](#开发与构建)
 - [开源协议](#开源协议)
 
-## 一个真的能解决海外用户B站卡顿的 Chrome 插件 当前版本：`0.9.4.2`
+## 一个真的能解决海外用户B站卡顿的 ~~Chrome~~ Firefox 插件 当前版本：将会尽力跟进 Firefox 版本
 
 更新日志： [CHANGELOG.md](CHANGELOG.md)
 
