@@ -1,6 +1,8 @@
 # Bilibili 线程撕裂者 Firefox 兼容版
 注意到 Bilibili 线程撕裂者 以油猴脚本形式安装在 FireFox 上时有兼容性问题，故修改了此 firefox 原生插件版本
 
+这是一个 MrTangLuyao/Bilibili-thread-ripper 的fork 修改版本
+
 ## 目录
 
 - [安装](#安装)
