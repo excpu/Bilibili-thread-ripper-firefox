@@ -15,3 +15,5 @@ Thumbs.db
 Desktop.ini
 *.log
 
+node_modules/
+
