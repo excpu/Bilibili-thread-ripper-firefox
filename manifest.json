@@ -52,6 +52,7 @@
       "js": [
         "src/range-core.js",
         "src/cdn-resolver.js",
+        "src/settings-panel.js",
         "src/sidx.js",
         "src/idm-downloader.js",
         "src/native-mse-player.js",

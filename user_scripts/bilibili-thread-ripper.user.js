@@ -634,6 +634,634 @@ const chrome = (() => {
   });
 })(globalThis);
 
+/* src/settings-panel.js */
+// The settings panel of both the extension and the userscript. It runs in the bilibili page
+// and opens from the extension's toolbar icon, the userscript manager's menu, or "自定义" in
+// the player's gear menu. Settings are read and saved through bridge.js, which keeps them in
+// the extension's storage (in the userscript, in localStorage).
+(function installSettingsPanel(root) {
+  "use strict";
+
+  if (root.__BTR_SETTINGS_PANEL__) return;
+  const core = root.__BILI_RANGE_CORE__;
+  const cdn = root.__BILI_CDN_RESOLVER_FACTORY__;
+  if (!core || !cdn) return;
+
+  const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
+  const HOST_ID = "__bilibili_thread_ripper_settings__";
+  const DIALOG_ID = "__bilibili_thread_ripper_settings_dialog__";
+  const LAUNCHER_ID = "__bilibili_thread_ripper_launcher__";
+  const THREAD_OPTIONS = [4, 8, 16, 32, 64, 128];
+  const MAX_CUSTOM_HOSTS = 32;
+  const HOST_GROUPS = [["大陆节点", cdn.MAINLAND_HOSTS], ["海外节点", cdn.OVERSEAS_HOSTS]];
+  const KNOWN_HOSTS = HOST_GROUPS.flatMap(([, hosts]) => hosts);
+
+  const PANEL_HTML = `
+    <main>
+      <header>
+        <div class="logo" aria-hidden="true">B</div>
+        <h1>线程撕裂者</h1>
+        <label class="switch" title="启用或停用">
+          <input id="enabled" type="checkbox">
+          <span></span>
+        </label>
+      </header>
+
+      <section class="mode-select" aria-label="CDN 模式">
+        <label><input type="radio" name="mode" value="mainland"><span>大陆</span></label>
+        <label><input type="radio" name="mode" value="overseas"><span>海外</span></label>
+        <label><input type="radio" name="mode" value="custom"><span>自定义</span></label>
+      </section>
+
+      <section id="custom-hosts" class="custom-hosts" aria-label="自定义服务器" hidden>
+        <div class="custom-head"><span>自定义服务器</span><b id="custom-count">0</b></div>
+        <p id="custom-empty" class="custom-note">还没选服务器，暂时按大陆 CDN 下载。</p>
+        <div id="known-hosts"></div>
+        <fieldset class="host-group">
+          <legend>手动添加</legend>
+          <div id="manual-hosts" class="manual-hosts"></div>
+          <form id="host-form" class="host-form">
+            <input id="host-input" type="text" placeholder="例如 upos-sz-mirrorali.bilivideo.com" spellcheck="false" autocomplete="off" aria-label="服务器地址">
+            <button type="submit">添加</button>
+          </form>
+          <p id="host-error" class="host-error" role="alert"></p>
+        </fieldset>
+        <p class="custom-note">只能填 B 站的视频服务器（bilivideo.com、akamaized.net 等），视频的下载地址不会发给别的网站。</p>
+      </section>
+
+      <section class="takeover-select" aria-label="接管方式">
+        <label><input type="radio" name="takeover" value="full"><span>全接管</span></label>
+        <label><input type="radio" name="takeover" value="compat"><span>兼容模式</span></label>
+      </section>
+      <p class="takeover-note">Safari 用户建议使用兼容模式。<br>全接管：视频由插件自己来放，下载和缓冲都由插件安排，速度最快。<br>兼容模式：当遇到播放问题或设置不生效时，尝试使用兼容模式。</p>
+
+      <section class="controls">
+        <div class="control-title">
+          <label for="concurrency">线程加载数</label>
+          <output id="thread-value" for="concurrency">8</output>
+        </div>
+        <div class="auto-row">
+          <label for="auto-concurrency">自动线程数<small>BTR将智能选择需要的线程数。</small></label>
+          <label class="switch"><input id="auto-concurrency" type="checkbox" aria-label="自动线程数"><span></span></label>
+        </div>
+        <div class="slider">
+          <div id="slider-fill" class="slider-fill" aria-hidden="true"></div>
+          <input id="concurrency" type="range" min="0" max="5" step="1" value="1" aria-label="线程加载数" aria-valuetext="8">
+        </div>
+        <div class="scale" aria-hidden="true">
+          <span>4</span><span>8</span><span>16</span><span>32</span><span>64</span><span>128</span>
+        </div>
+      </section>
+
+      <section class="notice-controls" aria-label="提示设置">
+        <div class="notice-row"><label for="live-enabled">直播加速（实验性）</label><label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速（实验性）"><span></span></label></div>
+        <div class="notice-row"><label for="error-notices">显示错误</label><label class="switch"><input id="error-notices" type="checkbox" aria-label="显示错误"><span></span></label></div>
+        <div class="notice-row"><label for="debug-notices">Debug 模式</label><label class="switch"><input id="debug-notices" type="checkbox" aria-label="Debug 模式"><span></span></label></div>
+        <div class="notice-row"><label for="floating-button">悬浮按钮</label><label class="switch"><input id="floating-button" type="checkbox" aria-label="悬浮按钮"><span></span></label></div>
+        <fieldset id="debug-filters" class="debug-filters" hidden>
+          <legend>显示哪些 Debug 消息</legend>
+          <div class="debug-filter-actions"><button id="debug-select-all" type="button">全选</button><button id="debug-select-none" type="button">全不选</button></div>
+          <div class="debug-filter-options">
+            <label><input type="checkbox" data-debug-category="takeover">接管与切换</label>
+            <label><input type="checkbox" data-debug-category="playback">播放与暂停</label>
+            <label><input type="checkbox" data-debug-category="download">下载线程</label>
+            <label><input type="checkbox" data-debug-category="buffer">缓冲与跳转</label>
+            <label><input type="checkbox" data-debug-category="settings">设置变化</label>
+            <label><input type="checkbox" data-debug-category="other">其他日志</label>
+          </div>
+        </fieldset>
+      </section>
+
+      <section class="current-threads" aria-live="polite">
+        <span>目前总线程</span>
+        <b id="active-count">0</b>
+      </section>
+    </main>`;
+
+  const PANEL_CSS = `
+    * { box-sizing: border-box; }
+    .btr-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, .35); }
+    .btr-popup { position: fixed; top: 72px; right: 24px; width: 320px; max-width: calc(100vw - 32px); max-height: calc(100vh - 96px); overflow: auto; border: 1px solid #30343d; border-radius: 12px; box-shadow: 0 12px 40px rgba(0, 0, 0, .45); color-scheme: dark; font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; background: #17191f; color: #f5f7fb; font-size: 14px; line-height: normal; text-align: left; }
+    main { padding: 18px 16px; }
+    header { display: grid; grid-template-columns: 42px 1fr auto; align-items: center; gap: 11px; margin-bottom: 22px; }
+    .logo { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 8px; color: #fff; font-size: 23px; font-weight: 800; background: #fb7299; }
+    h1 { margin: 0; font-size: 17px; letter-spacing: .2px; }
+    .switch { position: relative; width: 42px; height: 24px; }
+    .switch input { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+    .switch span { position: absolute; inset: 0; border-radius: 999px; background: #313a4c; cursor: pointer; transition: 160ms ease; }
+    .switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: 160ms ease; }
+    .switch input:checked + span { background: #fb7299; }
+    .switch input:checked + span::after { transform: translateX(18px); }
+    .switch input:focus-visible + span { outline: 2px solid #fff; outline-offset: 3px; }
+    .mode-select { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-bottom: 12px; overflow: hidden; border: 1px solid #30343d; border-radius: 8px; background: #30343d; }
+    .mode-select label { position: relative; }
+    .mode-select input { position: absolute; opacity: 0; }
+    .mode-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
+    .mode-select input:checked + span { color: #fff; background: #fb7299; }
+    .mode-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
+    .takeover-select { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; margin-bottom: 8px; overflow: hidden; border: 1px solid #30343d; border-radius: 8px; background: #30343d; }
+    .takeover-select label { position: relative; }
+    .takeover-select input { position: absolute; opacity: 0; }
+    .takeover-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
+    .takeover-select input:checked + span { color: #fff; background: #fb7299; }
+    .takeover-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
+    .takeover-note { margin: 0 0 12px; padding: 0 2px; color: #7f8797; font-size: 11px; line-height: 1.6; }
+    .custom-hosts { margin-bottom: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
+    .custom-hosts[hidden] { display: none; }
+    .custom-head { display: flex; align-items: center; justify-content: space-between; color: #c9ced9; font-size: 13px; }
+    .custom-head b { min-width: 28px; padding: 2px 8px; border-radius: 5px; background: #fb7299; color: #fff; font-size: 12px; text-align: center; }
+    .custom-note { margin: 8px 0 0; color: #7f8797; font-size: 11px; line-height: 1.6; }
+    .custom-note[hidden] { display: none; }
+    .host-group { min-width: 0; margin: 12px 0 0; padding: 10px 0 0; border: 0; border-top: 1px solid #343943; }
+    .host-group legend { padding: 0 0 4px; color: #c9ced9; font-size: 12px; }
+    .host-option { display: flex; align-items: center; gap: 7px; margin-top: 7px; color: #c9ced9; font-size: 11px; overflow-wrap: anywhere; cursor: pointer; }
+    .host-option input { flex: none; width: 14px; height: 14px; margin: 0; accent-color: #fb7299; cursor: pointer; }
+    .manual-host { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 7px; color: #c9ced9; font-size: 11px; overflow-wrap: anywhere; }
+    .manual-host button { flex: none; width: 22px; height: 22px; padding: 0; border: 1px solid #444b57; border-radius: 4px; background: #292d35; color: #d9dee8; font: inherit; line-height: 20px; cursor: pointer; }
+    .host-form { display: flex; gap: 6px; margin-top: 10px; }
+    .host-form input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid #444b57; border-radius: 5px; background: #17191f; color: #f5f7fb; font: inherit; font-size: 12px; }
+    .host-form button { flex: none; padding: 6px 10px; border: 0; border-radius: 5px; background: #fb7299; color: #fff; font: inherit; font-size: 12px; cursor: pointer; }
+    .host-error { min-height: 0; margin: 6px 0 0; color: #f28b85; font-size: 11px; }
+    .host-error:empty { display: none; }
+    .host-form input:focus-visible, .host-form button:focus-visible, .manual-host button:focus-visible, .host-option input:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+    .controls { padding: 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
+    .control-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+    .control-title label { color: #c9ced9; font-size: 13px; }
+    .auto-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .auto-row > label:first-child { display: flex; flex-direction: column; gap: 2px; color: #c9ced9; font-size: 13px; }
+    .auto-row small { color: #8a93a6; font-size: 11px; }
+    .controls.auto .slider, .controls.auto .scale { opacity: 0.4; pointer-events: none; }
+    output { min-width: 42px; padding: 4px 8px; border-radius: 5px; color: #fff; background: #fb7299; font-size: 13px; font-weight: 700; text-align: center; }
+    .slider { position: relative; width: 100%; height: 18px; border-radius: 9px; background: #3a3e47; }
+    .slider-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 60%; border-radius: 9px; background: #fb7299; pointer-events: none; }
+    input[type="range"] { position: absolute; inset: 0; width: 100%; height: 18px; margin: 0; appearance: none; -webkit-appearance: none; border: 0; outline: 0; background: transparent; cursor: pointer; }
+    input[type="range"]::-webkit-slider-runnable-track { height: 18px; background: transparent; }
+    input[type="range"]::-webkit-slider-thumb { width: 24px; height: 24px; margin-top: -3px; appearance: none; -webkit-appearance: none; border: 2px solid #fff; border-radius: 50%; background: #fff; }
+    input[type="range"]:focus-visible::-webkit-slider-thumb { border-color: #fb7299; }
+    .scale { display: flex; justify-content: space-between; margin-top: 5px; color: #7f8797; font-size: 10px; }
+    .scale span { width: 24px; text-align: center; }
+    .scale span:first-child { text-align: left; }
+    .scale span:last-child { text-align: right; }
+    .notice-controls { margin-top: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
+    .notice-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #c9ced9; font-size: 13px; }
+    .notice-row .switch { flex: none; }
+    .notice-row + .notice-row { margin-top: 14px; }
+    .debug-filters { min-width: 0; margin: 16px 0 0; padding: 12px 0 0; border: 0; border-top: 1px solid #343943; }
+    .debug-filters[hidden] { display: none; }
+    .debug-filters legend { padding: 0 0 4px; color: #c9ced9; font-size: 12px; }
+    .debug-filter-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+    .debug-filter-actions button { padding: 4px 8px; border: 1px solid #444b57; border-radius: 4px; background: #292d35; color: #d9dee8; font: inherit; font-size: 11px; cursor: pointer; }
+    .debug-filter-actions button:hover, .manual-host button:hover { border-color: #fb7299; }
+    .debug-filter-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 8px; }
+    .debug-filter-options label { display: flex; align-items: center; gap: 7px; color: #c9ced9; font-size: 12px; cursor: pointer; }
+    .debug-filter-options input { flex: none; width: 15px; height: 15px; margin: 0; accent-color: #fb7299; cursor: pointer; }
+    .debug-filter-actions button:focus-visible, .debug-filter-options input:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+    .current-threads { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; padding: 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; color: #c9ced9; font-size: 13px; }
+    .current-threads b { color: #fff; font-size: 20px; font-variant-numeric: tabular-nums; }
+    .btr-close { position: sticky; bottom: 12px; display: block; width: calc(100% - 32px); margin: 0 16px 16px; padding: 8px; border: 1px solid #444b57; border-radius: 6px; background: #292d35; color: #d9dee8; font: inherit; font-size: 13px; cursor: pointer; box-shadow: 0 -6px 12px #17191f; }
+    .btr-close:hover { border-color: #fb7299; }
+    .btr-close:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  `;
+
+  const LAUNCHER_CSS = `
+    .btr-launcher { position: fixed; right: 76px; bottom: 116px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: #fb7299; color: #fff; font: 700 13px/1 Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; letter-spacing: .3px; cursor: grab; opacity: .35; touch-action: none; box-shadow: 0 4px 14px rgba(0, 0, 0, .25); transition: opacity 160ms ease, transform 160ms ease, left 180ms ease, right 180ms ease; }
+    .btr-launcher:hover, .btr-launcher:focus-visible { opacity: 1; transform: scale(1.06); }
+    .btr-launcher:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+    .btr-launcher.dragging { cursor: grabbing; opacity: 1; transform: scale(1.1); transition: opacity 160ms ease, transform 160ms ease; }
+    @media (max-width: 700px) { .btr-launcher { width: 40px; height: 40px; font-size: 12px; } }
+  `;
+
+  let current = null;
+  // bridge.js sends the stored settings when they load or change, and the page its stats.
+  let latestSettings = null;
+  let latestStats = null;
+  const post = (type, payload) => root.postMessage({ channel: CHANNEL, type, payload }, "*");
+
+  function open() {
+    if (current) return;
+    // A modal <dialog> sits in the browser's top layer and is the only interactive part of
+    // the page while it is open. A plain fixed layer can end up under the page's own
+    // top-layer elements, or inside a part of the page made inert, and then clicks on it
+    // land on whatever is beneath (issue #8).
+    const dialog = document.createElement("dialog");
+    dialog.id = DIALOG_ID;
+    dialog.style.cssText = "all:initial!important;display:block!important;position:fixed!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;border:0!important;background:transparent!important;overflow:visible!important;z-index:2147483646!important;";
+    const dialogStyle = document.createElement("style");
+    dialogStyle.textContent = `#${DIALOG_ID}::backdrop{background:transparent}`;
+    const host = document.createElement("div");
+    host.id = HOST_ID;
+    host.style.cssText = "all:initial!important;position:fixed!important;inset:0!important;";
+    dialog.append(dialogStyle, host);
+    const shadow = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent = PANEL_CSS;
+    const backdrop = document.createElement("div");
+    backdrop.className = "btr-backdrop";
+    const panel = document.createElement("div");
+    panel.className = "btr-popup";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", "线程撕裂者设置");
+    panel.tabIndex = -1;
+    panel.innerHTML = PANEL_HTML;
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.className = "btr-close";
+    closeButton.textContent = "关闭";
+    panel.append(closeButton);
+    shadow.append(style, backdrop, panel);
+
+    const $ = (id) => shadow.getElementById(id);
+    const enabled = $("enabled");
+    const concurrency = $("concurrency");
+    const autoConcurrency = $("auto-concurrency");
+    const threadValue = $("thread-value");
+    const sliderFill = $("slider-fill");
+    const errorNotices = $("error-notices");
+    const debugNotices = $("debug-notices");
+    const liveEnabled = $("live-enabled");
+    const floatingButton = $("floating-button");
+    const debugFilters = $("debug-filters");
+    const debugCategoryInputs = [...shadow.querySelectorAll("[data-debug-category]")];
+    const customSection = $("custom-hosts");
+    const hostInput = $("host-input");
+    const hostError = $("host-error");
+    const activeCount = $("active-count");
+    let customHosts = [];
+
+    const save = (update) => post("settings-update", update);
+
+    function setSlider(threads) {
+      const index = THREAD_OPTIONS.indexOf(Number(threads));
+      const safe = index < 0 ? 1 : index;
+      concurrency.value = String(safe);
+      threadValue.value = String(THREAD_OPTIONS[safe]);
+      concurrency.setAttribute("aria-valuetext", String(THREAD_OPTIONS[safe]));
+      sliderFill.style.width = `${safe / (THREAD_OPTIONS.length - 1) * 100}%`;
+    }
+
+    function setMode(mode) {
+      for (const radio of shadow.querySelectorAll('input[name="mode"]')) radio.checked = radio.value === mode;
+      customSection.hidden = mode !== "custom";
+    }
+
+    function renderHosts() {
+      $("custom-count").textContent = String(customHosts.length);
+      $("custom-empty").hidden = customHosts.length > 0;
+      const known = $("known-hosts");
+      known.replaceChildren(...HOST_GROUPS.map(([title, hosts]) => {
+        const group = document.createElement("fieldset");
+        group.className = "host-group";
+        const legend = document.createElement("legend");
+        legend.textContent = title;
+        group.append(legend, ...hosts.map((value) => {
+          const label = document.createElement("label");
+          label.className = "host-option";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.value = value;
+          input.checked = customHosts.includes(value);
+          const text = document.createElement("span");
+          text.textContent = value;
+          label.append(input, text);
+          return label;
+        }));
+        return group;
+      }));
+      $("manual-hosts").replaceChildren(...customHosts.filter((value) => !KNOWN_HOSTS.includes(value)).map((value) => {
+        const row = document.createElement("div");
+        row.className = "manual-host";
+        const text = document.createElement("span");
+        text.textContent = value;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.dataset.remove = value;
+        remove.textContent = "×";
+        remove.setAttribute("aria-label", `删除 ${value}`);
+        row.append(text, remove);
+        return row;
+      }));
+    }
+
+    function setCustomHosts(next) {
+      customHosts = next;
+      renderHosts();
+      save({ customHosts });
+    }
+
+    function render(settings) {
+      enabled.checked = settings.enabled;
+      for (const radio of shadow.querySelectorAll('input[name="takeover"]')) radio.checked = radio.value === settings.takeover;
+      setSlider(settings.concurrency);
+      autoConcurrency.checked = settings.autoConcurrency === true;
+      concurrency.disabled = autoConcurrency.checked;
+      concurrency.closest(".controls").classList.toggle("auto", autoConcurrency.checked);
+      setMode(settings.mode);
+      customHosts = settings.customHosts;
+      renderHosts();
+      liveEnabled.checked = settings.liveEnabled !== false;
+      floatingButton.checked = settings.floatingButton !== false;
+      errorNotices.checked = settings.errorNotices;
+      debugNotices.checked = settings.debugNotices;
+      debugFilters.hidden = !settings.debugNotices;
+      for (const input of debugCategoryInputs) input.checked = settings.debugCategories[input.dataset.debugCategory] !== false;
+    }
+
+    const saveDebugCategories = () => save({ debugCategories: Object.fromEntries(debugCategoryInputs.map((input) => [input.dataset.debugCategory, input.checked])) });
+    enabled.addEventListener("change", () => save({ enabled: enabled.checked }));
+    liveEnabled.addEventListener("change", () => save({ liveEnabled: liveEnabled.checked }));
+    floatingButton.addEventListener("change", () => save({ floatingButton: floatingButton.checked }));
+    concurrency.addEventListener("input", () => {
+      const threads = THREAD_OPTIONS[Number(concurrency.value)];
+      setSlider(threads);
+      save({ concurrency: threads });
+    });
+    autoConcurrency.addEventListener("change", () => save({ autoConcurrency: autoConcurrency.checked }));
+    for (const radio of shadow.querySelectorAll('input[name="mode"]')) {
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        setMode(radio.value);
+        save({ mode: radio.value });
+      });
+    }
+    for (const radio of shadow.querySelectorAll('input[name="takeover"]')) {
+      radio.addEventListener("change", () => { if (radio.checked) save({ takeover: radio.value }); });
+    }
+    $("known-hosts").addEventListener("change", (event) => {
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement) || !KNOWN_HOSTS.includes(input.value)) return;
+      if (input.checked && customHosts.length >= MAX_CUSTOM_HOSTS) {
+        input.checked = false;
+        hostError.textContent = `最多选 ${MAX_CUSTOM_HOSTS} 个服务器。`;
+        return;
+      }
+      hostError.textContent = "";
+      setCustomHosts(input.checked ? [...customHosts.filter((value) => value !== input.value), input.value] : customHosts.filter((value) => value !== input.value));
+    });
+    $("manual-hosts").addEventListener("click", (event) => {
+      const value = event.target instanceof HTMLElement ? event.target.dataset.remove : "";
+      if (value) setCustomHosts(customHosts.filter((item) => item !== value));
+    });
+    $("host-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const value = core.normalizeCdnHost(hostInput.value);
+      if (!value) hostError.textContent = "这不是 B 站的视频服务器地址。";
+      else if (customHosts.includes(value)) hostError.textContent = "这个服务器已经在列表里了。";
+      else if (customHosts.length >= MAX_CUSTOM_HOSTS) hostError.textContent = `最多选 ${MAX_CUSTOM_HOSTS} 个服务器。`;
+      else {
+        hostError.textContent = "";
+        hostInput.value = "";
+        setCustomHosts([...customHosts, value]);
+      }
+    });
+    errorNotices.addEventListener("change", () => save({ errorNotices: errorNotices.checked }));
+    debugNotices.addEventListener("change", () => {
+      debugFilters.hidden = !debugNotices.checked;
+      save({ debugNotices: debugNotices.checked });
+    });
+    for (const input of debugCategoryInputs) input.addEventListener("change", saveDebugCategories);
+    $("debug-select-all").addEventListener("click", () => { for (const input of debugCategoryInputs) input.checked = true; saveDebugCategories(); });
+    $("debug-select-none").addEventListener("click", () => { for (const input of debugCategoryInputs) input.checked = false; saveDebugCategories(); });
+
+    // Keys typed into the panel belong to it. The shadow root hides the input from the page,
+    // so the player's shortcuts (space, F, arrows) would otherwise react to them.
+    const keepKeys = (event) => { if (event.key !== "Escape") event.stopPropagation(); };
+    for (const type of ["keydown", "keyup", "keypress"]) panel.addEventListener(type, keepKeys);
+
+    // The live thread count: asking for stats makes the page send fresh ones.
+    const refresh = () => {
+      activeCount.textContent = String(Math.max(0, Math.trunc(Number(latestStats?.activeThreads) || 0)));
+      post("get-stats");
+    };
+    const timer = setInterval(refresh, 400);
+    const onKey = (event) => { if (event.key === "Escape") close(); };
+    const close = () => {
+      if (current?.host !== host) return;
+      current = null;
+      clearInterval(timer);
+      launcher?.apply();
+      document.removeEventListener("keydown", onKey, true);
+      dialog.remove();
+    };
+    // Changes made elsewhere (the gear menu, another tab) arrive as new settings.
+    current = { host, close, render };
+    launcher?.apply();
+    backdrop.addEventListener("click", close);
+    closeButton.addEventListener("click", close);
+    document.addEventListener("keydown", onKey, true);
+    // Esc on a modal dialog closes it natively; clean up the same way as the button.
+    dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
+    (document.body || document.documentElement).append(dialog);
+    try { dialog.showModal(); }
+    catch (_error) { dialog.setAttribute("open", ""); }
+    render(latestSettings || core.normalizeSettings({}));
+    post("get-settings");
+    refresh();
+    panel.focus();
+  }
+
+  const toggle = () => (current ? current.close() : open());
+
+  // The button in the corner of every bilibili page. The toolbar icon only reaches the pages
+  // the extension runs on, and the userscript manager's menu is not obvious (and on the home
+  // page people do not find it at all), so the panel needs a way in that is always visible.
+  // It hides while the video is fullscreen and while the panel itself is open.
+  const launcher = (() => {
+    if (root.top !== root) return null;
+    const MARGIN = 12;
+    // How far a press has to travel before it counts as dragging rather than a click.
+    const DRAG_SLOP = 4;
+    // Let go this close to the left or right edge and it snaps flush to it; let go anywhere
+    // else and it simply stays where it was put.
+    const SNAP_MS = 72;
+    let host = null;
+    let button = null;
+    let wanted = true;
+    // Where the viewer left it, as shares of the window: 0 means stuck to the left edge, 1 to
+    // the right edge, anything between is a free spot. null: never moved.
+    let leftRatio = null;
+    let topRatio = null;
+    let dragging = null;
+
+    // Bilibili fills the screen in two ways: the browser fullscreen API, and its own 网页全屏,
+    // which only resizes the player inside the page. Rather than follow Bilibili class names,
+    // this asks the picture itself: a video that covers the window is a video being watched
+    // full screen, whichever way it got there.
+    const fullscreen = () => {
+      if (document.fullscreenElement || document.webkitFullscreenElement || document.webkitIsFullScreen) return true;
+      const width = root.innerWidth, height = root.innerHeight;
+      if (!width || !height) return false;
+      for (const video of document.querySelectorAll("video")) {
+        const box = video.getBoundingClientRect();
+        if (box.width >= width * 0.92 && box.height >= height * 0.92) return true;
+      }
+      return false;
+    };
+
+    const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
+
+    // Puts it back where it was left. Without a saved spot it sits where it always did: to the
+    // left of Bilibili's own column of round buttons, near the bottom.
+    function place() {
+      if (!button) return;
+      const size = button.offsetHeight || 44;
+      const width = root.innerWidth || 0, height = root.innerHeight || 0;
+      if (leftRatio === null || topRatio === null) {
+        button.style.top = `${Math.round(Math.max(MARGIN, height - size - 116))}px`;
+        button.style.right = "76px";
+        button.style.left = "auto";
+        button.style.bottom = "auto";
+        return;
+      }
+      button.style.top = `${Math.round(clamp(topRatio * height, MARGIN, Math.max(MARGIN, height - size - MARGIN)))}px`;
+      button.style.bottom = "auto";
+      if (leftRatio >= 1) {
+        button.style.right = `${MARGIN}px`;
+        button.style.left = "auto";
+        return;
+      }
+      button.style.left = `${Math.round(clamp(leftRatio * width, MARGIN, Math.max(MARGIN, width - size - MARGIN)))}px`;
+      button.style.right = "auto";
+    }
+
+    function startDrag(event) {
+      if (event.button !== undefined && event.button !== 0) return;
+      const box = button.getBoundingClientRect();
+      dragging = {
+        pointerId: event.pointerId,
+        grabX: event.clientX - box.left,
+        grabY: event.clientY - box.top,
+        fromX: event.clientX,
+        fromY: event.clientY,
+        moved: false
+      };
+      try { button.setPointerCapture(event.pointerId); } catch (_error) {}
+    }
+
+    function moveDrag(event) {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      if (!dragging.moved && Math.hypot(event.clientX - dragging.fromX, event.clientY - dragging.fromY) < DRAG_SLOP) return;
+      dragging.moved = true;
+      button.classList.add("dragging");
+      const size = button.offsetHeight || 44;
+      const width = root.innerWidth, height = root.innerHeight;
+      // Kept as numbers: where it lands is decided from these, not from a fresh layout
+      // read, which the browser is free to postpone until the pointer is already up.
+      dragging.left = Math.round(clamp(event.clientX - dragging.grabX, MARGIN, width - size - MARGIN));
+      dragging.top = Math.round(clamp(event.clientY - dragging.grabY, MARGIN, height - size - MARGIN));
+      dragging.size = size;
+      button.style.left = `${dragging.left}px`;
+      button.style.top = `${dragging.top}px`;
+      button.style.right = "auto";
+      event.preventDefault();
+    }
+
+    function endDrag(event) {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      const { moved, left = 0, top = 0, size = 44 } = dragging;
+      try { button.releasePointerCapture(dragging.pointerId); } catch (_error) {}
+      dragging = null;
+      button.classList.remove("dragging");
+      if (!moved) return;
+      // Dropped within reach of the left or right edge: snap flush to it, and remember the
+      // edge rather than the pixel, so it stays there whatever the window size. Dropped
+      // anywhere else: it stays exactly where it was put.
+      const width = root.innerWidth || 1;
+      if (left <= SNAP_MS) leftRatio = 0;
+      else if (left + size >= width - SNAP_MS) leftRatio = 1;
+      else leftRatio = clamp(left / width, 0, 1);
+      topRatio = clamp(top / (root.innerHeight || 1), 0, 1);
+      place();
+      post("settings-update", { floatingButtonLeft: leftRatio, floatingButtonTop: topRatio });
+    }
+
+    function mount() {
+      if (host?.isConnected) return;
+      host = document.createElement("div");
+      host.id = LAUNCHER_ID;
+      host.style.cssText = "all:initial!important;position:fixed!important;right:0!important;bottom:0!important;width:0!important;height:0!important;z-index:2147483645!important;";
+      const shadow = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = LAUNCHER_CSS;
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "btr-launcher";
+      button.title = "线程撕裂者设置（可以拖动）";
+      button.setAttribute("aria-label", "线程撕裂者设置");
+      button.textContent = "BTR";
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        // A drag that ended on the button itself must not also open the panel.
+        if (button.dataset.dragged === "true") {
+          button.dataset.dragged = "";
+          return;
+        }
+        toggle();
+      });
+      button.addEventListener("pointerdown", startDrag);
+      button.addEventListener("pointermove", moveDrag);
+      for (const type of ["pointerup", "pointercancel"]) {
+        button.addEventListener(type, (event) => {
+          const moved = Boolean(dragging?.moved);
+          endDrag(event);
+          if (moved) button.dataset.dragged = "true";
+        });
+      }
+      shadow.append(style, button);
+      (document.body || document.documentElement).append(host);
+      place();
+    }
+
+    function apply() {
+      const show = wanted && !fullscreen() && !current;
+      if (!show) {
+        host?.remove();
+        return;
+      }
+      mount();
+      // Bilibili replaces large parts of the page when you navigate; put it back if it went.
+      if (!host.isConnected) (document.body || document.documentElement).append(host);
+      if (!dragging) place();
+    }
+
+    const update = (settings) => {
+      wanted = settings?.floatingButton !== false;
+      // null (never dragged) must stay null: Number(null) is 0, which would pin it to a corner.
+      const ratio = (value) => (value != null && Number(value) >= 0 && Number(value) <= 1 ? Number(value) : null);
+      leftRatio = ratio(settings?.floatingButtonLeft);
+      topRatio = ratio(settings?.floatingButtonTop);
+      apply();
+    };
+    for (const type of ["fullscreenchange", "webkitfullscreenchange"]) document.addEventListener(type, apply, true);
+    root.addEventListener("resize", apply);
+    // A page that swaps its body (the SPA navigations) drops the button with it.
+    setInterval(apply, 2000);
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply, { once: true });
+    // The button is on by default, so it is there before the stored settings arrive.
+    apply();
+    return { update, apply };
+  })();
+
+  root.addEventListener("message", (event) => {
+    if (event.source !== root || event.data?.channel !== CHANNEL) return;
+    if (event.data.type === "settings") {
+      latestSettings = core.normalizeSettings(event.data.payload);
+      launcher?.update(latestSettings);
+      current?.render(latestSettings);
+    } else if (event.data.type === "stats") {
+      latestStats = event.data.payload;
+    } else if (event.data.type === "open-settings" && root.top === root) {
+      // The toolbar icon toggles the panel; "自定义" in the gear menu only opens it.
+      if (event.data.payload?.toggle) toggle();
+      else open();
+    }
+  });
+  // The userscript manager's menu entry.
+  document.addEventListener("btr-userscript-open-settings", () => { if (root.top === root) toggle(); });
+
+  root.__BTR_SETTINGS_PANEL__ = Object.freeze({ open, close: () => current?.close(), toggle, isOpen: () => Boolean(current) });
+})(globalThis);
+
 /* src/sidx.js */
 (function installSidx(root) {
   "use strict";
@@ -3165,594 +3793,6 @@ const chrome = (() => {
   root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, playbackDeadlineAt, qualityLabel, selectRepresentations });
 })(globalThis);
 
-/* src/native-range-transport.js */
-(function installNativeRangeTransport(root) {
-  "use strict";
-
-  const core = root.__BILI_RANGE_CORE__;
-  if (root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__) return;
-  const resolvers = root.__BILI_CDN_RESOLVER_FACTORY__;
-  const downloaders = root.__BILI_IDM_DOWNLOADER_FACTORY__;
-  if (!core || !resolvers || !downloaders || !root.fetch || !root.XMLHttpRequest) return;
-  const nativeFetch = root.fetch.bind(root);
-  // The compatibility mode ("兼容模式" in the settings): Bilibili's own player keeps the
-  // decoder, the buffer and the quality switching, and only its media requests are
-  // downloaded here. Safari needs it, because replacing the MediaSource breaks its quality
-  // switching. Nothing is intercepted until a player of this mode is created.
-  let active = null;
-  let passthroughFetch = nativeFetch;
-
-  function nativeCore(video) {
-    const wrapper = root.player?.__core?.(), dash = wrapper?.getCorePlayer?.();
-    if (!dash || dash.getVideoElement?.() !== video) return null;
-    if (![video.requestVideoFrameCallback, wrapper.fire, wrapper.getQualityChangedData,
-      dash.on, dash.off, dash.getQualityFor].every(method => typeof method === "function")) {
-      throw new Error("原生播放器接口不兼容");
-    }
-    return dash;
-  }
-
-  function nativeSwitchPending() {
-    try {
-      const quality = root.player?.getQuality?.();
-      const current = Number(quality?.nowQ), target = Number(quality?.newQ);
-      return Number.isFinite(current) && Number.isFinite(target) && current > 0 && target > 0 && current !== target;
-    } catch (_error) { return false; }
-  }
-
-  // A completed VOD scheduler stays stopped when Bilibili changes quality.
-  // Reopen scheduling during that request; native rules still choose every
-  // fragment. Never restart a running scheduler: start() clears its append lock.
-  function attachQualityGuard(dash, video, note, unavailable) {
-    const records = new Map();
-    let disposed = false;
-    const fail = error => {
-      release();
-      note("native quality guard unavailable", String(error?.message || error));
-      unavailable(error);
-    };
-    const protect = fn => (...args) => {
-      if (disposed) return;
-      try { return fn(...args); }
-      catch (error) { fail(error); }
-    };
-    const clear = record => {
-      record.pending = null;
-      clearTimeout(record.timer);
-      if (record.frame) video.cancelVideoFrameCallback?.(record.frame);
-      record.frame = 0;
-    };
-    const restore = record => {
-      clear(record);
-      if (record.buffer.getIsBufferingCompleted === record.wrapped) record.buffer.getIsBufferingCompleted = record.original;
-    };
-    function oldFuture(record) {
-      const model = record.processor.getFragmentModel?.(), target = dash.getQualityFor(record.processor.getType());
-      const history = model?.getRequests?.({ state: "executed", type: "MediaSegment" }) || [];
-      return history.some(request => request && request.quality !== target && request.startTime > video.currentTime
-        && model.getRequests({ state: "executed", time: request.startTime + request.duration / 2, threshold: 0 })?.[0] === request);
-    }
-    function finishSource() {
-      const source = [...records.values()][0]?.buffer.getMediaSource?.();
-      if (disposed || source?.readyState !== "open" || source.sourceBuffers.length !== records.size) return;
-      if ([...records.values()].every(record => record.buffer.getMediaSource?.() === source
-        && record.buffer.getIsBufferingCompleted() && !record.processor.getFragmentModel?.()?.getLoadingRequests?.().length)
-        && [...source.sourceBuffers].every(buffer => !buffer.updating)) source.endOfStream();
-    }
-    function resumeFuture(record) {
-      if (disposed || dash.getFastSwitchEnabled?.() === false) return;
-      const processor = record.processor, scheduler = processor.getScheduleController();
-      if (scheduler.isStarted()) return;
-      const target = dash.getQualityFor(processor.getType());
-      const duration = processor.getRepresentationInfoForQuality?.(target)?.fragmentDuration || 5;
-      const offsets = dash.getFastSwitchQnV2Enabled?.() ? [1, 1.5] : [1.5];
-      const due = offsets.some(offset => {
-        const request = processor.getFragmentModel?.()?.getRequests?.({ state: "executed", time: video.currentTime + duration * offset, threshold: 0 })?.[0];
-        return request?.type === "MediaSegment" && request.quality !== target;
-      });
-      if (due) { scheduler.start(); note("native future replacement resumed", processor.getType()); }
-    }
-    function observe(event) {
-      const buffer = event.sender, processor = buffer?.getStreamProcessor?.(), type = processor?.getType?.();
-      if (type !== "video" && type !== "audio") return;
-      if (typeof buffer.getIsBufferingCompleted !== "function" || typeof processor.getScheduleController !== "function") {
-        throw new Error("原生缓冲接口不兼容");
-      }
-      const scheduler = processor.getScheduleController();
-      if (typeof scheduler?.isStarted !== "function" || typeof scheduler.start !== "function") throw new Error("原生调度接口不兼容");
-      const previous = records.get(type);
-      if (previous?.processor === processor) {
-        queueMicrotask(protect(() => { if (records.get(type) === previous) { resumeFuture(previous); finishSource(); } }));
-        return;
-      }
-      if (previous) restore(previous);
-      const record = { buffer, processor, original: buffer.getIsBufferingCompleted, pending: null, frame: 0 };
-      // A successful switch only confirms the current segment. Keep native
-      // replacement scheduling alive while later buffered segments are old.
-      record.wrapped = function () {
-        const completed = record.original.call(this);
-        if (!completed) return false;
-        try { return !record.pending && !oldFuture(record); }
-        catch (error) { fail(error); return completed; }
-      };
-      buffer.getIsBufferingCompleted = record.wrapped;
-      records.set(type, record);
-    }
-    function requested(event) {
-      const record = records.get(event.mediaType);
-      if (!record || !Number.isInteger(event.newQuality)) return;
-      clear(record);
-      record.pending = event;
-      // Only a cleanup bound: Bilibili keeps its original switch timeout.
-      record.timer = setTimeout(() => clear(record), 21000);
-      const processor = record.processor;
-      queueMicrotask(protect(() => {
-        if (record.pending !== event) return;
-        const scheduler = processor.getScheduleController();
-        if (!scheduler.isStarted()) { scheduler.start(); note("native stopped scheduler resumed", event.mediaType); }
-      }));
-
-      // After seeking back into an old rendition, the requested quality can
-      // already be displayed. Native rendering notifications require a change
-      // from the previous frame and otherwise never resolve this request.
-      const wrapper = root.player?.__core?.();
-      if (event.mediaType !== "video" || !video.requestVideoFrameCallback || typeof wrapper?.fire !== "function"
-        || typeof wrapper.getQualityChangedData !== "function") return;
-      const at = time => processor.getFragmentModel?.()?.getRequests?.({ state: "executed", time, threshold: 0 })
-        ?.find(request => request?.type === "MediaSegment");
-      const target = processor.getMediaInfo?.()?.bitrateList?.[event.newQuality];
-      if (!target) return;
-      let frames = 0, switching = null;
-      const confirm = (_now, metadata) => {
-        record.frame = 0;
-        if (disposed || record.pending !== event || wrapper.getCorePlayer() !== dash) return;
-        const current = wrapper.qnSwitchingInfo?.video, request = at(metadata.mediaTime);
-        if (!current?.switching || current.qn !== event.newQuality || typeof current.listener !== "function"
-          || (switching && switching !== current)) return;
-        switching = current;
-        // Native history may be absent immediately after a seek. Observe until
-        // matching frames arrive; an index/init response alone is never success.
-        frames = request?.quality === event.newQuality && video.videoWidth === target.width
-          && video.videoHeight === target.height ? frames + 1 : 0;
-        if (frames < 2) { record.frame = video.requestVideoFrameCallback(protect(confirm)); return; }
-        const rendered = { type: "qualityChangeRendered", mediaType: "video", oldQuality: event.oldQuality, newQuality: event.newQuality,
-          index: request.index, requestType: request.type, isMediaSegment: true };
-        wrapper.fire("qualityChangeRendered", wrapper.getQualityChangedData(rendered));
-        current.listener(rendered);
-        clear(record);
-        note("native already-rendered quality confirmed", `${target.width}x${target.height} / 2 decoded frames`);
-      };
-      record.frame = video.requestVideoFrameCallback(protect(confirm));
-    }
-    function rendered(event) {
-      const record = records.get(event.mediaType);
-      if (record?.pending?.newQuality === event.newQuality) clear(record);
-    }
-    const handlers = { bufferLevelUpdated: protect(observe), qualityChangeRequested: protect(requested), qualityChangeRendered: protect(rendered) };
-    try {
-      for (const [name, handler] of Object.entries(handlers)) dash.on(name, handler);
-    } catch (error) {
-      release();
-      throw error;
-    }
-    function release() {
-      if (disposed) return;
-      disposed = true;
-      for (const [name, handler] of Object.entries(handlers)) {
-        try { dash.off(name, handler); } catch (_error) { /* Still restore buffers if the native core changed. */ }
-      }
-      for (const record of records.values()) {
-        try { restore(record); } catch (_error) { /* Continue cleaning other processors. */ }
-      }
-      records.clear();
-    }
-    return release;
-  }
-
-  // Only bounded, ordinary media GETs are replaced. Authentication, conditional
-  // requests, open-ended ranges, sync XHR and unknown files retain native behavior.
-  function planRequest(url, method, headers, credentials) {
-    const owner = active;
-    if (!owner || owner.disposed || !owner.settings().enabled || method !== "GET"
-      || credentials === "include" || !core.isBilibiliMediaUrl(url)) return null;
-    if ([...headers.keys()].some(name => !["range", "accept"].includes(name))) return null;
-    const range = core.parseRangeHeader(headers.get("range"));
-    if (!range || !Number.isSafeInteger(range.length)) return null;
-    const track = owner.track(url);
-    if (!track || !owner.sampleQuality()) return null;
-    if (nativeSwitchPending()) owner.nativeSwitchRequest();
-    return { owner, url, range, track };
-  }
-
-  // Both loaders use one downloader, with the existing CDN policy, retries,
-  // thread budget and transfer statistics. FetchLoader can swallow reader errors:
-  // finish and validate the range before resolving fetch, so failure rejects the
-  // request instead of becoming an invisible error in a partially delivered body.
-  async function download(plan, signal, progress = () => {}) {
-    const { owner, range, track } = plan;
-    if (signal?.aborted) throw signal.reason;
-    if (owner.disposed) throw new DOMException("加速任务已停止", "AbortError");
-    const controller = new AbortController();
-    const cancel = () => controller.abort(signal.reason);
-    signal?.addEventListener("abort", cancel, { once: true });
-    owner.jobs.add(controller);
-    let received = 0, total = null;
-    const chunks = [];
-    try {
-      const result = await owner.downloader.downloadRange(range, owner.resolver(plan.url, track), {
-        signal: controller.signal, parallel: true, startup: true, kind: track.kind,
-        onOrderedChunk(bytes, piece, fileTotal) {
-          if (controller.signal.aborted) throw controller.signal.reason;
-          if (piece.start !== range.start + received || bytes.byteLength !== piece.length
-            || !Number.isSafeInteger(fileTotal) || fileTotal <= range.end
-            || (total !== null && total !== fileTotal)) throw new Error("媒体 Range 校验失败");
-          total = fileTotal;
-          chunks.push(bytes);
-          received += bytes.byteLength;
-          progress(received, total);
-        }
-      });
-      if (controller.signal.aborted) throw controller.signal.reason;
-      if (received !== range.length || result.total !== total) throw new Error("媒体 Range 长度不符");
-      const bytes = core.concatChunks(chunks, received);
-      owner.delivered(track, result);
-      return { bytes, headers: new Headers({
-        "Content-Type": track.representation.mimeType || track.representation.mime_type || `${track.kind}/mp4`,
-        "Content-Length": String(range.length), "Content-Range": `bytes ${range.start}-${range.end}/${total}`,
-        "Accept-Ranges": "bytes"
-      }) };
-    } catch (error) {
-      if (!controller.signal.aborted && !owner.disposed) owner.failed(error);
-      throw controller.signal.aborted ? controller.signal.reason : error;
-    } finally {
-      controller.abort();
-      signal?.removeEventListener("abort", cancel);
-      owner.jobs.delete(controller);
-    }
-  }
-
-  function responseURL(response, url) {
-    const clone = response.clone.bind(response);
-    Object.defineProperties(response, {
-      url: { value: url },
-      clone: { value: () => responseURL(clone(), url) }
-    });
-    return response;
-  }
-
-  function interceptedFetch(input, init) {
-    const url = input instanceof Request ? input.url : String(input);
-    const method = String(init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
-    if (!active || method !== "GET" || !core.isBilibiliMediaUrl(url)) return passthroughFetch(input, init);
-    let request;
-    try { request = new Request(input instanceof Request ? input : new URL(String(input), root.location.href), init); }
-    catch (_error) { return passthroughFetch(input, init); }
-    const plan = request.mode === "no-cors" || request.integrity ? null
-      : planRequest(request.url, request.method, request.headers, request.credentials);
-    if (!plan) return passthroughFetch(input, init);
-    return download(plan, request.signal).then(({ bytes, headers }) => {
-      if (request.signal.aborted) throw request.signal.reason;
-      return responseURL(new Response(bytes, { status: 206, statusText: "Partial Content", headers }), request.url);
-    });
-  }
-
-  // Preserve the actual XMLHttpRequest object, event handlers and prototype. Only
-  // eligible arraybuffer requests receive a synthetic response. Calling open()
-  // again restores all native response accessors before the object is reused.
-  const proto = root.XMLHttpRequest.prototype;
-  // Taken when the interception is installed, so anything already wrapping fetch or
-  // XMLHttpRequest (the playurl reader of page-hook.js) stays in the chain.
-  let nativeOpen, nativeSend, nativeAbort, nativeSetHeader, nativeGetHeader, nativeGetHeaders;
-  const requests = new WeakMap();
-  const fields = ["readyState", "status", "statusText", "response", "responseText", "responseURL"];
-  function emit(xhr, type, progress) {
-    xhr.dispatchEvent(progress ? new ProgressEvent(type, progress) : new Event(type));
-  }
-  function restore(xhr, entry) {
-    if (!entry?.synthetic) return;
-    for (const key of fields) {
-      const descriptor = entry.descriptors[key];
-      if (descriptor) Object.defineProperty(xhr, key, descriptor);
-      else delete xhr[key];
-    }
-    entry.synthetic = false;
-  }
-  function isCurrent(xhr, entry) { return requests.get(xhr) === entry && entry.sending; }
-  function finish(xhr, entry, type) {
-    if (!isCurrent(xhr, entry)) return;
-    clearTimeout(entry.timer);
-    entry.sending = false;
-    entry.state = 4;
-    emit(xhr, "readystatechange");
-    if (requests.get(xhr) !== entry || entry.state !== 4) return;
-    const progress = { lengthComputable: type === "load", loaded: entry.body?.byteLength || 0, total: entry.body?.byteLength || 0 };
-    emit(xhr, type, progress);
-    if (requests.get(xhr) === entry) emit(xhr, "loadend", progress);
-  }
-  const patchedOpen = function (method, url, async = true, ...rest) {
-    const previous = requests.get(this);
-    requests.delete(this);
-    if (previous) {
-      previous.sending = false;
-      clearTimeout(previous.timer);
-      previous.controller?.abort();
-      restore(this, previous);
-    }
-    const result = nativeOpen.call(this, method, url, async, ...rest);
-    requests.set(this, { method: String(method).toUpperCase(), url: new URL(String(url), root.location.href).href,
-      async: async !== false, headers: new Headers(), authenticated: rest.some(value => value != null), sending: false, synthetic: false });
-    return result;
-  };
-  const patchedSetRequestHeader = function (name, value) {
-    const entry = requests.get(this);
-    if (entry?.synthetic) throw new DOMException("Call open() before sending again", "InvalidStateError");
-    const result = nativeSetHeader.call(this, name, value);
-    entry?.headers.append(name, value);
-    return result;
-  };
-  const patchedGetResponseHeader = function (name) {
-    const entry = requests.get(this);
-    return entry?.synthetic ? (entry.state >= 2 ? entry.responseHeaders.get(name) : null) : nativeGetHeader.call(this, name);
-  };
-  const patchedGetAllResponseHeaders = function () {
-    const entry = requests.get(this);
-    return entry?.synthetic ? (entry.state >= 2 ? [...entry.responseHeaders].map(([key, value]) => `${key}: ${value}\r\n`).join("") : "") : nativeGetHeaders.call(this);
-  };
-  const patchedAbort = function () {
-    const entry = requests.get(this);
-    if (!entry?.synthetic) return nativeAbort.call(this);
-    entry.status = 0; entry.statusText = ""; entry.responseUrl = ""; entry.body = null; entry.responseHeaders = new Headers();
-    if (entry.sending) {
-      entry.controller.abort();
-      finish(this, entry, "abort");
-    }
-    if (requests.get(this) === entry && !entry.sending) entry.state = 0;
-  };
-  const patchedSend = function (body) {
-    const entry = requests.get(this);
-    if (entry?.synthetic) throw new DOMException("Call open() before sending again", "InvalidStateError");
-    if (this.readyState !== 1) return nativeSend.call(this, body);
-    const plan = entry?.async && !entry.authenticated && body == null && this.responseType === "arraybuffer"
-      ? planRequest(entry.url, entry.method, entry.headers, this.withCredentials ? "include" : "same-origin") : null;
-    if (!plan) return nativeSend.call(this, body);
-    entry.sending = true; entry.synthetic = true; entry.state = 1;
-    entry.status = 0; entry.statusText = ""; entry.body = null; entry.responseUrl = "";
-    entry.responseHeaders = new Headers(); entry.controller = new AbortController();
-    entry.descriptors = Object.fromEntries(fields.map(key => [key, Object.getOwnPropertyDescriptor(this, key)]));
-    Object.defineProperties(this, {
-      readyState: { configurable: true, get: () => entry.state },
-      status: { configurable: true, get: () => entry.status },
-      statusText: { configurable: true, get: () => entry.statusText },
-      response: { configurable: true, get: () => entry.state === 4 ? entry.body : null },
-      responseText: { configurable: true, get() { throw new DOMException("arraybuffer response", "InvalidStateError"); } },
-      responseURL: { configurable: true, get: () => entry.responseUrl }
-    });
-    if (this.timeout > 0) entry.timer = setTimeout(() => {
-      if (!isCurrent(this, entry)) return;
-      entry.controller.abort();
-      entry.status = 0; entry.statusText = ""; entry.responseUrl = ""; entry.responseHeaders = new Headers();
-      finish(this, entry, "timeout");
-    }, this.timeout);
-    emit(this, "loadstart", { lengthComputable: false, loaded: 0, total: 0 });
-    if (!isCurrent(this, entry)) return;
-    entry.loaded = 0;
-    const reportProgress = (received, total) => {
-      if (!isCurrent(this, entry)) return;
-      if (entry.state === 1) {
-        entry.status = 206; entry.statusText = "Partial Content"; entry.responseUrl = entry.url;
-        entry.responseHeaders = new Headers({ "content-range": `bytes ${plan.range.start}-${plan.range.end}/${total}`, "content-length": String(plan.range.length), "content-type": plan.track.representation.mimeType || plan.track.representation.mime_type || `${plan.track.kind}/mp4` });
-        entry.state = 2; emit(this, "readystatechange");
-      }
-      if (!isCurrent(this, entry) || received <= entry.loaded) return;
-      entry.loaded = received;
-      entry.state = 3; emit(this, "readystatechange");
-      if (isCurrent(this, entry)) emit(this, "progress", { lengthComputable: true, loaded: received, total: plan.range.length });
-    };
-    download(plan, entry.controller.signal, reportProgress).then(result => {
-      if (!isCurrent(this, entry)) return;
-      entry.responseHeaders = result.headers; entry.responseUrl = entry.url;
-      entry.body = result.bytes.buffer;
-      finish(this, entry, "load");
-    }).catch(() => {
-      if (!isCurrent(this, entry)) return;
-      entry.status = 0; entry.statusText = ""; entry.responseUrl = ""; entry.body = null; entry.responseHeaders = new Headers();
-      finish(this, entry, "error");
-    });
-  };
-
-  // Only a player of this mode installs the interception, and what is in place then keeps
-  // working under it. The other mode never sees any of this.
-  let intercepting = false;
-  function installInterception() {
-    if (intercepting) return;
-    intercepting = true;
-    passthroughFetch = root.fetch.bind(root);
-    nativeOpen = proto.open;
-    nativeSend = proto.send;
-    nativeAbort = proto.abort;
-    nativeSetHeader = proto.setRequestHeader;
-    nativeGetHeader = proto.getResponseHeader;
-    nativeGetHeaders = proto.getAllResponseHeaders;
-    root.fetch = interceptedFetch;
-    proto.open = patchedOpen;
-    proto.setRequestHeader = patchedSetRequestHeader;
-    proto.getResponseHeader = patchedGetResponseHeader;
-    proto.getAllResponseHeaders = patchedGetAllResponseHeaders;
-    proto.abort = patchedAbort;
-    proto.send = patchedSend;
-  }
-
-  function createNativePlayer(options) {
-    const video = options.container.querySelector("video");
-    if (!video) throw new Error("没有找到 B 站原生 video 元素");
-    installInterception();
-    if (active) active.destroy();
-    let tracks = [], lastVideo = null, lastAudio = null;
-    let delivered = 0, failures = 0, nativeSwitchRequests = 0;
-    let qualityState = "", guardedDash = null, releaseGuard = null;
-    let coreWaitStarted = null, coreWaitTimer = null;
-    const cache = new Map(), jobs = new Set(), timeline = [];
-    let lastError = "";
-    const settings = () => core.normalizeSettings(options.getSettings());
-    const note = (what, detail = "") => {
-      timeline.push({ at: Math.round(performance.now()), time: Number(video.currentTime) || 0, what, detail });
-      if (timeline.length > 120) timeline.shift();
-    };
-    const update = playinfo => {
-      const dash = playinfo?.data?.dash || playinfo?.result?.dash || playinfo?.dash;
-      if (!dash) return;
-      const audio = [...(dash.audio || []), ...[].concat(dash.dolby?.audio || [], dash.flac?.audio || [])];
-      tracks = (dash.video || []).map(representation => ({ kind: "video", representation }))
-        .concat(audio.map(representation => ({ kind: "audio", representation })));
-      // Retain healthy-node history across same-video playurl updates.
-    };
-    update(options.playinfo);
-    const urls = representation => [representation.baseUrl || representation.base_url, ...[].concat(representation.backupUrl || representation.backup_url || [])].filter(Boolean);
-    const pathOf = url => { try { return new URL(url).pathname; } catch (_error) { return ""; } };
-    function unavailable(error) {
-      if (owner.disposed) return;
-      owner.destroy();
-      lastError = `原生播放器接口发生变化，已停止加速：${error?.message || error}`;
-      note("native quality guard unavailable", lastError);
-      options.onLog?.("已交回 B 站原生播放", lastError, "error", "playback");
-      options.onState?.({ playerState: "native-fallback", lastError });
-    }
-    function sampleQuality() {
-      if (owner.disposed || !settings().enabled) return false;
-      try {
-        const dash = nativeCore(video);
-        if (dash !== guardedDash) {
-          releaseGuard?.(); releaseGuard = null; guardedDash = null;
-        }
-        if (!dash) {
-          // Codec/source changes can briefly remove the native core. Suspend
-          // interception during that gap; never accelerate without the guard.
-          if (coreWaitStarted === null) {
-            coreWaitStarted = performance.now();
-            for (const controller of jobs) controller.abort();
-            note("native core transition: acceleration suspended");
-          }
-          if (performance.now() - coreWaitStarted >= 3000) throw new Error("原生内核未恢复");
-          coreWaitTimer ??= setTimeout(() => { coreWaitTimer = null; sampleQuality(); }, 100);
-          return false;
-        }
-        clearTimeout(coreWaitTimer); coreWaitTimer = null; coreWaitStarted = null;
-        if (!releaseGuard) {
-          releaseGuard = attachQualityGuard(dash, video, note, unavailable);
-          guardedDash = dash;
-        }
-        const quality = root.player?.getQuality?.();
-        const value = `${quality?.nowQ}/${quality?.newQ}/${quality?.realQ}`;
-        if (value !== qualityState) { qualityState = value; note("native quality now/target/rendered", value); }
-        return true;
-      } catch (error) { unavailable(error); return false; }
-    }
-    const publish = () => {
-      if (owner.disposed) return;
-      sampleQuality();
-      if (owner.disposed) return;
-      const rendered = tracks.find(track => track.kind === "video" && Number(track.representation.id) === Number(qualityState.split("/")[0]))?.representation;
-      options.onState?.({ playerState: video.error ? "error" : video.ended ? "ended" : video.readyState >= 3 ? "ready" : "buffering",
-        lastError: video.error ? video.error.message || `媒体错误 ${video.error.code}` : lastError,
-        mode: settings().mode, quality: rendered ? root.__BILI_NATIVE_MSE_PLAYER_FACTORY__?.qualityLabel?.(rendered) || String(rendered.id) : "原生画质",
-        bufferedAhead: bufferedAhead(), cdnHosts: [...cache.values()].flatMap(resolver => resolver.status()) });
-    };
-    function bufferedAhead() {
-      const time = Number(video.currentTime) || 0;
-      for (let i = 0; i < video.buffered.length; i++) if (video.buffered.start(i) <= time && video.buffered.end(i) > time) return video.buffered.end(i) - time;
-      return 0;
-    }
-    const owner = {
-      disposed: false, jobs, settings, sampleQuality,
-      track: url => tracks.find(track => urls(track.representation).some(candidate => pathOf(candidate) === pathOf(url))) || null,
-      resolver(url, track) {
-        const parsed = new URL(url), key = parsed.pathname + parsed.search;
-        if (!cache.has(key)) {
-          if (cache.size >= 64) cache.delete(cache.keys().next().value);
-          cache.set(key, resolvers.createResolver({ ...track.representation, baseUrl: url, base_url: url }, () => settings().mode, options.cdnBans, () => settings().customHosts));
-        }
-        return cache.get(key);
-      },
-      delivered(track, result) {
-        if (owner.disposed) return;
-        if (track.kind === "video") lastVideo = track.representation;
-        else lastAudio = track.representation;
-        lastError = "";
-        delivered++;
-        note("native range delivered", `${track.kind} ${result.byteLength} bytes / ${result.pieceCount} pieces`);
-        options.onSegment?.({ kind: track.kind, bytes: result.byteLength, pieces: result.pieceCount, hosts: result.hosts });
-        publish();
-      },
-      nativeSwitchRequest() {
-        nativeSwitchRequests++;
-        note("quality switch: accelerated request");
-      },
-      failed(error) {
-        failures++;
-        lastError = String(error?.message || error);
-        note("native range failed", lastError);
-        options.onLog?.("媒体分段下载失败", lastError, "error", "download");
-        publish();
-        // Reject the original loader request; Bilibili owns playback recovery.
-      },
-      destroy() {
-        if (owner.disposed) return;
-        owner.disposed = true;
-        clearTimeout(coreWaitTimer); coreWaitTimer = null;
-        releaseGuard?.(); releaseGuard = null; guardedDash = null;
-        for (const controller of jobs) controller.abort();
-        events.abort();
-        if (active === owner) active = null;
-        // The native media source, buffers, playback position and pause state are untouched.
-      }
-    };
-    owner.downloader = downloaders.createDownloader({ getSettings: settings, nativeFetch, onTransfer: options.onTransfer });
-    const events = new AbortController();
-    for (const name of ["playing", "waiting", "stalled", "seeking", "seeked", "ended", "loadedmetadata", "error", "progress", "timeupdate"]) video.addEventListener(name, () => {
-      if (name !== "timeupdate" && name !== "progress") note(`media ${name}`, `buffer ${bufferedAhead().toFixed(2)}s`);
-      if (name === "error") options.onLog?.("B 站播放器出错了", video.error?.message || `媒体错误 ${video.error?.code}`, "error", "playback");
-      if (name === "playing") lastError = "";
-      if (name === "timeupdate") sampleQuality();
-      else publish();
-    }, { signal: events.signal });
-    active = owner;
-    note("native transport attached");
-    queueMicrotask(publish);
-    return Object.freeze({
-      nativeTransport: true, video,
-      get transportActive() { return !owner.disposed && settings().enabled && !!releaseGuard && coreWaitStarted === null; },
-      applySettings() {
-        if (owner.disposed) return;
-        if (!settings().enabled) { owner.destroy(); return; }
-        owner.downloader.applySettings(); sampleQuality();
-      },
-      async updatePlayinfo(playinfo) { update(playinfo); },
-      destroy: owner.destroy,
-      getDebug: () => ({ architecture: "native-player-range-transport", transportRevision: 6, qualityGuardRevision: 11, nativeQualityGuard: !!guardedDash,
-        qualityId: Number(qualityState.split("/")[0]) || 0, downloadedQualityId: Number(lastVideo?.id) || 0,
-        width: video.videoWidth, height: video.videoHeight, currentTime: Number(video.currentTime) || 0,
-        videoType: lastVideo?.mimeType || lastVideo?.mime_type || "", audioType: lastAudio?.mimeType || lastAudio?.mime_type || "",
-        videoBandwidth: Number(lastVideo?.bandwidth) || 0, audioBandwidth: Number(lastAudio?.bandwidth) || 0,
-        codec: lastVideo?.codecs || "", frameRate: (() => {
-          const [n, d = 1] = String(lastVideo?.frameRate || lastVideo?.frame_rate || 0).split("/").map(Number);
-          return d ? n / d : 0;
-        })(),
-        acceleratedRanges: delivered, failedRanges: failures, nativeSwitchRequests,
-        nativeQuality: qualityState, nativeSwitchPending: nativeSwitchPending(), activeRequests: jobs.size,
-        mediaSourceReplacements: 0, timeline: timeline.slice() })
-    });
-  }
-  root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__ = Object.freeze({
-    createNativePlayer,
-    supports(container) {
-      try {
-        const video = container?.querySelector("video");
-        return !!video && !!nativeCore(video);
-      } catch (_error) { return false; }
-    }
-  });
-})(globalThis);
-
 /* src/runtime-notices.js */
 (function installRuntimeNotices(root) {
   "use strict";
@@ -3898,634 +3938,6 @@ const chrome = (() => {
       if (settings.debugNotices) post("playback-notice", { attached: false, playing: false, route: "", session: 0 });
     }
   });
-})(globalThis);
-
-/* src/settings-panel.js */
-// The settings panel of both the extension and the userscript. It runs in the bilibili page
-// and opens from the extension's toolbar icon, the userscript manager's menu, or "自定义" in
-// the player's gear menu. Settings are read and saved through bridge.js, which keeps them in
-// the extension's storage (in the userscript, in localStorage).
-(function installSettingsPanel(root) {
-  "use strict";
-
-  if (root.__BTR_SETTINGS_PANEL__) return;
-  const core = root.__BILI_RANGE_CORE__;
-  const cdn = root.__BILI_CDN_RESOLVER_FACTORY__;
-  if (!core || !cdn) return;
-
-  const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const HOST_ID = "__bilibili_thread_ripper_settings__";
-  const DIALOG_ID = "__bilibili_thread_ripper_settings_dialog__";
-  const LAUNCHER_ID = "__bilibili_thread_ripper_launcher__";
-  const THREAD_OPTIONS = [4, 8, 16, 32, 64, 128];
-  const MAX_CUSTOM_HOSTS = 32;
-  const HOST_GROUPS = [["大陆节点", cdn.MAINLAND_HOSTS], ["海外节点", cdn.OVERSEAS_HOSTS]];
-  const KNOWN_HOSTS = HOST_GROUPS.flatMap(([, hosts]) => hosts);
-
-  const PANEL_HTML = `
-    <main>
-      <header>
-        <div class="logo" aria-hidden="true">B</div>
-        <h1>线程撕裂者</h1>
-        <label class="switch" title="启用或停用">
-          <input id="enabled" type="checkbox">
-          <span></span>
-        </label>
-      </header>
-
-      <section class="mode-select" aria-label="CDN 模式">
-        <label><input type="radio" name="mode" value="mainland"><span>大陆</span></label>
-        <label><input type="radio" name="mode" value="overseas"><span>海外</span></label>
-        <label><input type="radio" name="mode" value="custom"><span>自定义</span></label>
-      </section>
-
-      <section id="custom-hosts" class="custom-hosts" aria-label="自定义服务器" hidden>
-        <div class="custom-head"><span>自定义服务器</span><b id="custom-count">0</b></div>
-        <p id="custom-empty" class="custom-note">还没选服务器，暂时按大陆 CDN 下载。</p>
-        <div id="known-hosts"></div>
-        <fieldset class="host-group">
-          <legend>手动添加</legend>
-          <div id="manual-hosts" class="manual-hosts"></div>
-          <form id="host-form" class="host-form">
-            <input id="host-input" type="text" placeholder="例如 upos-sz-mirrorali.bilivideo.com" spellcheck="false" autocomplete="off" aria-label="服务器地址">
-            <button type="submit">添加</button>
-          </form>
-          <p id="host-error" class="host-error" role="alert"></p>
-        </fieldset>
-        <p class="custom-note">只能填 B 站的视频服务器（bilivideo.com、akamaized.net 等），视频的下载地址不会发给别的网站。</p>
-      </section>
-
-      <section class="takeover-select" aria-label="接管方式">
-        <label><input type="radio" name="takeover" value="full"><span>全接管</span></label>
-        <label><input type="radio" name="takeover" value="compat"><span>兼容模式</span></label>
-      </section>
-      <p class="takeover-note">Safari 用户建议使用兼容模式。<br>全接管：视频由插件自己来放，下载和缓冲都由插件安排，速度最快。<br>兼容模式：当遇到播放问题或设置不生效时，尝试使用兼容模式。</p>
-
-      <section class="controls">
-        <div class="control-title">
-          <label for="concurrency">线程加载数</label>
-          <output id="thread-value" for="concurrency">8</output>
-        </div>
-        <div class="auto-row">
-          <label for="auto-concurrency">自动线程数<small>BTR将智能选择需要的线程数。</small></label>
-          <label class="switch"><input id="auto-concurrency" type="checkbox" aria-label="自动线程数"><span></span></label>
-        </div>
-        <div class="slider">
-          <div id="slider-fill" class="slider-fill" aria-hidden="true"></div>
-          <input id="concurrency" type="range" min="0" max="5" step="1" value="1" aria-label="线程加载数" aria-valuetext="8">
-        </div>
-        <div class="scale" aria-hidden="true">
-          <span>4</span><span>8</span><span>16</span><span>32</span><span>64</span><span>128</span>
-        </div>
-      </section>
-
-      <section class="notice-controls" aria-label="提示设置">
-        <div class="notice-row"><label for="live-enabled">直播加速（实验性）</label><label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速（实验性）"><span></span></label></div>
-        <div class="notice-row"><label for="error-notices">显示错误</label><label class="switch"><input id="error-notices" type="checkbox" aria-label="显示错误"><span></span></label></div>
-        <div class="notice-row"><label for="debug-notices">Debug 模式</label><label class="switch"><input id="debug-notices" type="checkbox" aria-label="Debug 模式"><span></span></label></div>
-        <div class="notice-row"><label for="floating-button">悬浮按钮</label><label class="switch"><input id="floating-button" type="checkbox" aria-label="悬浮按钮"><span></span></label></div>
-        <fieldset id="debug-filters" class="debug-filters" hidden>
-          <legend>显示哪些 Debug 消息</legend>
-          <div class="debug-filter-actions"><button id="debug-select-all" type="button">全选</button><button id="debug-select-none" type="button">全不选</button></div>
-          <div class="debug-filter-options">
-            <label><input type="checkbox" data-debug-category="takeover">接管与切换</label>
-            <label><input type="checkbox" data-debug-category="playback">播放与暂停</label>
-            <label><input type="checkbox" data-debug-category="download">下载线程</label>
-            <label><input type="checkbox" data-debug-category="buffer">缓冲与跳转</label>
-            <label><input type="checkbox" data-debug-category="settings">设置变化</label>
-            <label><input type="checkbox" data-debug-category="other">其他日志</label>
-          </div>
-        </fieldset>
-      </section>
-
-      <section class="current-threads" aria-live="polite">
-        <span>目前总线程</span>
-        <b id="active-count">0</b>
-      </section>
-    </main>`;
-
-  const PANEL_CSS = `
-    * { box-sizing: border-box; }
-    .btr-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, .35); }
-    .btr-popup { position: fixed; top: 72px; right: 24px; width: 320px; max-width: calc(100vw - 32px); max-height: calc(100vh - 96px); overflow: auto; border: 1px solid #30343d; border-radius: 12px; box-shadow: 0 12px 40px rgba(0, 0, 0, .45); color-scheme: dark; font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; background: #17191f; color: #f5f7fb; font-size: 14px; line-height: normal; text-align: left; }
-    main { padding: 18px 16px; }
-    header { display: grid; grid-template-columns: 42px 1fr auto; align-items: center; gap: 11px; margin-bottom: 22px; }
-    .logo { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 8px; color: #fff; font-size: 23px; font-weight: 800; background: #fb7299; }
-    h1 { margin: 0; font-size: 17px; letter-spacing: .2px; }
-    .switch { position: relative; width: 42px; height: 24px; }
-    .switch input { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
-    .switch span { position: absolute; inset: 0; border-radius: 999px; background: #313a4c; cursor: pointer; transition: 160ms ease; }
-    .switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: 160ms ease; }
-    .switch input:checked + span { background: #fb7299; }
-    .switch input:checked + span::after { transform: translateX(18px); }
-    .switch input:focus-visible + span { outline: 2px solid #fff; outline-offset: 3px; }
-    .mode-select { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-bottom: 12px; overflow: hidden; border: 1px solid #30343d; border-radius: 8px; background: #30343d; }
-    .mode-select label { position: relative; }
-    .mode-select input { position: absolute; opacity: 0; }
-    .mode-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
-    .mode-select input:checked + span { color: #fff; background: #fb7299; }
-    .mode-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
-    .takeover-select { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; margin-bottom: 8px; overflow: hidden; border: 1px solid #30343d; border-radius: 8px; background: #30343d; }
-    .takeover-select label { position: relative; }
-    .takeover-select input { position: absolute; opacity: 0; }
-    .takeover-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
-    .takeover-select input:checked + span { color: #fff; background: #fb7299; }
-    .takeover-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
-    .takeover-note { margin: 0 0 12px; padding: 0 2px; color: #7f8797; font-size: 11px; line-height: 1.6; }
-    .custom-hosts { margin-bottom: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
-    .custom-hosts[hidden] { display: none; }
-    .custom-head { display: flex; align-items: center; justify-content: space-between; color: #c9ced9; font-size: 13px; }
-    .custom-head b { min-width: 28px; padding: 2px 8px; border-radius: 5px; background: #fb7299; color: #fff; font-size: 12px; text-align: center; }
-    .custom-note { margin: 8px 0 0; color: #7f8797; font-size: 11px; line-height: 1.6; }
-    .custom-note[hidden] { display: none; }
-    .host-group { min-width: 0; margin: 12px 0 0; padding: 10px 0 0; border: 0; border-top: 1px solid #343943; }
-    .host-group legend { padding: 0 0 4px; color: #c9ced9; font-size: 12px; }
-    .host-option { display: flex; align-items: center; gap: 7px; margin-top: 7px; color: #c9ced9; font-size: 11px; overflow-wrap: anywhere; cursor: pointer; }
-    .host-option input { flex: none; width: 14px; height: 14px; margin: 0; accent-color: #fb7299; cursor: pointer; }
-    .manual-host { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 7px; color: #c9ced9; font-size: 11px; overflow-wrap: anywhere; }
-    .manual-host button { flex: none; width: 22px; height: 22px; padding: 0; border: 1px solid #444b57; border-radius: 4px; background: #292d35; color: #d9dee8; font: inherit; line-height: 20px; cursor: pointer; }
-    .host-form { display: flex; gap: 6px; margin-top: 10px; }
-    .host-form input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid #444b57; border-radius: 5px; background: #17191f; color: #f5f7fb; font: inherit; font-size: 12px; }
-    .host-form button { flex: none; padding: 6px 10px; border: 0; border-radius: 5px; background: #fb7299; color: #fff; font: inherit; font-size: 12px; cursor: pointer; }
-    .host-error { min-height: 0; margin: 6px 0 0; color: #f28b85; font-size: 11px; }
-    .host-error:empty { display: none; }
-    .host-form input:focus-visible, .host-form button:focus-visible, .manual-host button:focus-visible, .host-option input:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-    .controls { padding: 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
-    .control-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
-    .control-title label { color: #c9ced9; font-size: 13px; }
-    .auto-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-    .auto-row > label:first-child { display: flex; flex-direction: column; gap: 2px; color: #c9ced9; font-size: 13px; }
-    .auto-row small { color: #8a93a6; font-size: 11px; }
-    .controls.auto .slider, .controls.auto .scale { opacity: 0.4; pointer-events: none; }
-    output { min-width: 42px; padding: 4px 8px; border-radius: 5px; color: #fff; background: #fb7299; font-size: 13px; font-weight: 700; text-align: center; }
-    .slider { position: relative; width: 100%; height: 18px; border-radius: 9px; background: #3a3e47; }
-    .slider-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 60%; border-radius: 9px; background: #fb7299; pointer-events: none; }
-    input[type="range"] { position: absolute; inset: 0; width: 100%; height: 18px; margin: 0; appearance: none; -webkit-appearance: none; border: 0; outline: 0; background: transparent; cursor: pointer; }
-    input[type="range"]::-webkit-slider-runnable-track { height: 18px; background: transparent; }
-    input[type="range"]::-webkit-slider-thumb { width: 24px; height: 24px; margin-top: -3px; appearance: none; -webkit-appearance: none; border: 2px solid #fff; border-radius: 50%; background: #fff; }
-    input[type="range"]:focus-visible::-webkit-slider-thumb { border-color: #fb7299; }
-    .scale { display: flex; justify-content: space-between; margin-top: 5px; color: #7f8797; font-size: 10px; }
-    .scale span { width: 24px; text-align: center; }
-    .scale span:first-child { text-align: left; }
-    .scale span:last-child { text-align: right; }
-    .notice-controls { margin-top: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
-    .notice-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #c9ced9; font-size: 13px; }
-    .notice-row .switch { flex: none; }
-    .notice-row + .notice-row { margin-top: 14px; }
-    .debug-filters { min-width: 0; margin: 16px 0 0; padding: 12px 0 0; border: 0; border-top: 1px solid #343943; }
-    .debug-filters[hidden] { display: none; }
-    .debug-filters legend { padding: 0 0 4px; color: #c9ced9; font-size: 12px; }
-    .debug-filter-actions { display: flex; gap: 8px; margin-bottom: 12px; }
-    .debug-filter-actions button { padding: 4px 8px; border: 1px solid #444b57; border-radius: 4px; background: #292d35; color: #d9dee8; font: inherit; font-size: 11px; cursor: pointer; }
-    .debug-filter-actions button:hover, .manual-host button:hover { border-color: #fb7299; }
-    .debug-filter-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 8px; }
-    .debug-filter-options label { display: flex; align-items: center; gap: 7px; color: #c9ced9; font-size: 12px; cursor: pointer; }
-    .debug-filter-options input { flex: none; width: 15px; height: 15px; margin: 0; accent-color: #fb7299; cursor: pointer; }
-    .debug-filter-actions button:focus-visible, .debug-filter-options input:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
-    .current-threads { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; padding: 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; color: #c9ced9; font-size: 13px; }
-    .current-threads b { color: #fff; font-size: 20px; font-variant-numeric: tabular-nums; }
-    .btr-close { position: sticky; bottom: 12px; display: block; width: calc(100% - 32px); margin: 0 16px 16px; padding: 8px; border: 1px solid #444b57; border-radius: 6px; background: #292d35; color: #d9dee8; font: inherit; font-size: 13px; cursor: pointer; box-shadow: 0 -6px 12px #17191f; }
-    .btr-close:hover { border-color: #fb7299; }
-    .btr-close:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-  `;
-
-  const LAUNCHER_CSS = `
-    .btr-launcher { position: fixed; right: 76px; bottom: 116px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: #fb7299; color: #fff; font: 700 13px/1 Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; letter-spacing: .3px; cursor: grab; opacity: .35; touch-action: none; box-shadow: 0 4px 14px rgba(0, 0, 0, .25); transition: opacity 160ms ease, transform 160ms ease, left 180ms ease, right 180ms ease; }
-    .btr-launcher:hover, .btr-launcher:focus-visible { opacity: 1; transform: scale(1.06); }
-    .btr-launcher:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-    .btr-launcher.dragging { cursor: grabbing; opacity: 1; transform: scale(1.1); transition: opacity 160ms ease, transform 160ms ease; }
-    @media (max-width: 700px) { .btr-launcher { width: 40px; height: 40px; font-size: 12px; } }
-  `;
-
-  let current = null;
-  // bridge.js sends the stored settings when they load or change, and the page its stats.
-  let latestSettings = null;
-  let latestStats = null;
-  const post = (type, payload) => root.postMessage({ channel: CHANNEL, type, payload }, "*");
-
-  function open() {
-    if (current) return;
-    // A modal <dialog> sits in the browser's top layer and is the only interactive part of
-    // the page while it is open. A plain fixed layer can end up under the page's own
-    // top-layer elements, or inside a part of the page made inert, and then clicks on it
-    // land on whatever is beneath (issue #8).
-    const dialog = document.createElement("dialog");
-    dialog.id = DIALOG_ID;
-    dialog.style.cssText = "all:initial!important;display:block!important;position:fixed!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;border:0!important;background:transparent!important;overflow:visible!important;z-index:2147483646!important;";
-    const dialogStyle = document.createElement("style");
-    dialogStyle.textContent = `#${DIALOG_ID}::backdrop{background:transparent}`;
-    const host = document.createElement("div");
-    host.id = HOST_ID;
-    host.style.cssText = "all:initial!important;position:fixed!important;inset:0!important;";
-    dialog.append(dialogStyle, host);
-    const shadow = host.attachShadow({ mode: "open" });
-    const style = document.createElement("style");
-    style.textContent = PANEL_CSS;
-    const backdrop = document.createElement("div");
-    backdrop.className = "btr-backdrop";
-    const panel = document.createElement("div");
-    panel.className = "btr-popup";
-    panel.setAttribute("role", "dialog");
-    panel.setAttribute("aria-label", "线程撕裂者设置");
-    panel.tabIndex = -1;
-    panel.innerHTML = PANEL_HTML;
-    const closeButton = document.createElement("button");
-    closeButton.type = "button";
-    closeButton.className = "btr-close";
-    closeButton.textContent = "关闭";
-    panel.append(closeButton);
-    shadow.append(style, backdrop, panel);
-
-    const $ = (id) => shadow.getElementById(id);
-    const enabled = $("enabled");
-    const concurrency = $("concurrency");
-    const autoConcurrency = $("auto-concurrency");
-    const threadValue = $("thread-value");
-    const sliderFill = $("slider-fill");
-    const errorNotices = $("error-notices");
-    const debugNotices = $("debug-notices");
-    const liveEnabled = $("live-enabled");
-    const floatingButton = $("floating-button");
-    const debugFilters = $("debug-filters");
-    const debugCategoryInputs = [...shadow.querySelectorAll("[data-debug-category]")];
-    const customSection = $("custom-hosts");
-    const hostInput = $("host-input");
-    const hostError = $("host-error");
-    const activeCount = $("active-count");
-    let customHosts = [];
-
-    const save = (update) => post("settings-update", update);
-
-    function setSlider(threads) {
-      const index = THREAD_OPTIONS.indexOf(Number(threads));
-      const safe = index < 0 ? 1 : index;
-      concurrency.value = String(safe);
-      threadValue.value = String(THREAD_OPTIONS[safe]);
-      concurrency.setAttribute("aria-valuetext", String(THREAD_OPTIONS[safe]));
-      sliderFill.style.width = `${safe / (THREAD_OPTIONS.length - 1) * 100}%`;
-    }
-
-    function setMode(mode) {
-      for (const radio of shadow.querySelectorAll('input[name="mode"]')) radio.checked = radio.value === mode;
-      customSection.hidden = mode !== "custom";
-    }
-
-    function renderHosts() {
-      $("custom-count").textContent = String(customHosts.length);
-      $("custom-empty").hidden = customHosts.length > 0;
-      const known = $("known-hosts");
-      known.replaceChildren(...HOST_GROUPS.map(([title, hosts]) => {
-        const group = document.createElement("fieldset");
-        group.className = "host-group";
-        const legend = document.createElement("legend");
-        legend.textContent = title;
-        group.append(legend, ...hosts.map((value) => {
-          const label = document.createElement("label");
-          label.className = "host-option";
-          const input = document.createElement("input");
-          input.type = "checkbox";
-          input.value = value;
-          input.checked = customHosts.includes(value);
-          const text = document.createElement("span");
-          text.textContent = value;
-          label.append(input, text);
-          return label;
-        }));
-        return group;
-      }));
-      $("manual-hosts").replaceChildren(...customHosts.filter((value) => !KNOWN_HOSTS.includes(value)).map((value) => {
-        const row = document.createElement("div");
-        row.className = "manual-host";
-        const text = document.createElement("span");
-        text.textContent = value;
-        const remove = document.createElement("button");
-        remove.type = "button";
-        remove.dataset.remove = value;
-        remove.textContent = "×";
-        remove.setAttribute("aria-label", `删除 ${value}`);
-        row.append(text, remove);
-        return row;
-      }));
-    }
-
-    function setCustomHosts(next) {
-      customHosts = next;
-      renderHosts();
-      save({ customHosts });
-    }
-
-    function render(settings) {
-      enabled.checked = settings.enabled;
-      for (const radio of shadow.querySelectorAll('input[name="takeover"]')) radio.checked = radio.value === settings.takeover;
-      setSlider(settings.concurrency);
-      autoConcurrency.checked = settings.autoConcurrency === true;
-      concurrency.disabled = autoConcurrency.checked;
-      concurrency.closest(".controls").classList.toggle("auto", autoConcurrency.checked);
-      setMode(settings.mode);
-      customHosts = settings.customHosts;
-      renderHosts();
-      liveEnabled.checked = settings.liveEnabled !== false;
-      floatingButton.checked = settings.floatingButton !== false;
-      errorNotices.checked = settings.errorNotices;
-      debugNotices.checked = settings.debugNotices;
-      debugFilters.hidden = !settings.debugNotices;
-      for (const input of debugCategoryInputs) input.checked = settings.debugCategories[input.dataset.debugCategory] !== false;
-    }
-
-    const saveDebugCategories = () => save({ debugCategories: Object.fromEntries(debugCategoryInputs.map((input) => [input.dataset.debugCategory, input.checked])) });
-    enabled.addEventListener("change", () => save({ enabled: enabled.checked }));
-    liveEnabled.addEventListener("change", () => save({ liveEnabled: liveEnabled.checked }));
-    floatingButton.addEventListener("change", () => save({ floatingButton: floatingButton.checked }));
-    concurrency.addEventListener("input", () => {
-      const threads = THREAD_OPTIONS[Number(concurrency.value)];
-      setSlider(threads);
-      save({ concurrency: threads });
-    });
-    autoConcurrency.addEventListener("change", () => save({ autoConcurrency: autoConcurrency.checked }));
-    for (const radio of shadow.querySelectorAll('input[name="mode"]')) {
-      radio.addEventListener("change", () => {
-        if (!radio.checked) return;
-        setMode(radio.value);
-        save({ mode: radio.value });
-      });
-    }
-    for (const radio of shadow.querySelectorAll('input[name="takeover"]')) {
-      radio.addEventListener("change", () => { if (radio.checked) save({ takeover: radio.value }); });
-    }
-    $("known-hosts").addEventListener("change", (event) => {
-      const input = event.target;
-      if (!(input instanceof HTMLInputElement) || !KNOWN_HOSTS.includes(input.value)) return;
-      if (input.checked && customHosts.length >= MAX_CUSTOM_HOSTS) {
-        input.checked = false;
-        hostError.textContent = `最多选 ${MAX_CUSTOM_HOSTS} 个服务器。`;
-        return;
-      }
-      hostError.textContent = "";
-      setCustomHosts(input.checked ? [...customHosts.filter((value) => value !== input.value), input.value] : customHosts.filter((value) => value !== input.value));
-    });
-    $("manual-hosts").addEventListener("click", (event) => {
-      const value = event.target instanceof HTMLElement ? event.target.dataset.remove : "";
-      if (value) setCustomHosts(customHosts.filter((item) => item !== value));
-    });
-    $("host-form").addEventListener("submit", (event) => {
-      event.preventDefault();
-      const value = core.normalizeCdnHost(hostInput.value);
-      if (!value) hostError.textContent = "这不是 B 站的视频服务器地址。";
-      else if (customHosts.includes(value)) hostError.textContent = "这个服务器已经在列表里了。";
-      else if (customHosts.length >= MAX_CUSTOM_HOSTS) hostError.textContent = `最多选 ${MAX_CUSTOM_HOSTS} 个服务器。`;
-      else {
-        hostError.textContent = "";
-        hostInput.value = "";
-        setCustomHosts([...customHosts, value]);
-      }
-    });
-    errorNotices.addEventListener("change", () => save({ errorNotices: errorNotices.checked }));
-    debugNotices.addEventListener("change", () => {
-      debugFilters.hidden = !debugNotices.checked;
-      save({ debugNotices: debugNotices.checked });
-    });
-    for (const input of debugCategoryInputs) input.addEventListener("change", saveDebugCategories);
-    $("debug-select-all").addEventListener("click", () => { for (const input of debugCategoryInputs) input.checked = true; saveDebugCategories(); });
-    $("debug-select-none").addEventListener("click", () => { for (const input of debugCategoryInputs) input.checked = false; saveDebugCategories(); });
-
-    // Keys typed into the panel belong to it. The shadow root hides the input from the page,
-    // so the player's shortcuts (space, F, arrows) would otherwise react to them.
-    const keepKeys = (event) => { if (event.key !== "Escape") event.stopPropagation(); };
-    for (const type of ["keydown", "keyup", "keypress"]) panel.addEventListener(type, keepKeys);
-
-    // The live thread count: asking for stats makes the page send fresh ones.
-    const refresh = () => {
-      activeCount.textContent = String(Math.max(0, Math.trunc(Number(latestStats?.activeThreads) || 0)));
-      post("get-stats");
-    };
-    const timer = setInterval(refresh, 400);
-    const onKey = (event) => { if (event.key === "Escape") close(); };
-    const close = () => {
-      if (current?.host !== host) return;
-      current = null;
-      clearInterval(timer);
-      launcher?.apply();
-      document.removeEventListener("keydown", onKey, true);
-      dialog.remove();
-    };
-    // Changes made elsewhere (the gear menu, another tab) arrive as new settings.
-    current = { host, close, render };
-    launcher?.apply();
-    backdrop.addEventListener("click", close);
-    closeButton.addEventListener("click", close);
-    document.addEventListener("keydown", onKey, true);
-    // Esc on a modal dialog closes it natively; clean up the same way as the button.
-    dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
-    (document.body || document.documentElement).append(dialog);
-    try { dialog.showModal(); }
-    catch (_error) { dialog.setAttribute("open", ""); }
-    render(latestSettings || core.normalizeSettings({}));
-    post("get-settings");
-    refresh();
-    panel.focus();
-  }
-
-  const toggle = () => (current ? current.close() : open());
-
-  // The button in the corner of every bilibili page. The toolbar icon only reaches the pages
-  // the extension runs on, and the userscript manager's menu is not obvious (and on the home
-  // page people do not find it at all), so the panel needs a way in that is always visible.
-  // It hides while the video is fullscreen and while the panel itself is open.
-  const launcher = (() => {
-    if (root.top !== root) return null;
-    const MARGIN = 12;
-    // How far a press has to travel before it counts as dragging rather than a click.
-    const DRAG_SLOP = 4;
-    // Let go this close to the left or right edge and it snaps flush to it; let go anywhere
-    // else and it simply stays where it was put.
-    const SNAP_MS = 72;
-    let host = null;
-    let button = null;
-    let wanted = true;
-    // Where the viewer left it, as shares of the window: 0 means stuck to the left edge, 1 to
-    // the right edge, anything between is a free spot. null: never moved.
-    let leftRatio = null;
-    let topRatio = null;
-    let dragging = null;
-
-    // Bilibili fills the screen in two ways: the browser fullscreen API, and its own 网页全屏,
-    // which only resizes the player inside the page. Rather than follow Bilibili class names,
-    // this asks the picture itself: a video that covers the window is a video being watched
-    // full screen, whichever way it got there.
-    const fullscreen = () => {
-      if (document.fullscreenElement || document.webkitFullscreenElement || document.webkitIsFullScreen) return true;
-      const width = root.innerWidth, height = root.innerHeight;
-      if (!width || !height) return false;
-      for (const video of document.querySelectorAll("video")) {
-        const box = video.getBoundingClientRect();
-        if (box.width >= width * 0.92 && box.height >= height * 0.92) return true;
-      }
-      return false;
-    };
-
-    const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
-
-    // Puts it back where it was left. Without a saved spot it sits where it always did: to the
-    // left of Bilibili's own column of round buttons, near the bottom.
-    function place() {
-      if (!button) return;
-      const size = button.offsetHeight || 44;
-      const width = root.innerWidth || 0, height = root.innerHeight || 0;
-      if (leftRatio === null || topRatio === null) {
-        button.style.top = `${Math.round(Math.max(MARGIN, height - size - 116))}px`;
-        button.style.right = "76px";
-        button.style.left = "auto";
-        button.style.bottom = "auto";
-        return;
-      }
-      button.style.top = `${Math.round(clamp(topRatio * height, MARGIN, Math.max(MARGIN, height - size - MARGIN)))}px`;
-      button.style.bottom = "auto";
-      if (leftRatio >= 1) {
-        button.style.right = `${MARGIN}px`;
-        button.style.left = "auto";
-        return;
-      }
-      button.style.left = `${Math.round(clamp(leftRatio * width, MARGIN, Math.max(MARGIN, width - size - MARGIN)))}px`;
-      button.style.right = "auto";
-    }
-
-    function startDrag(event) {
-      if (event.button !== undefined && event.button !== 0) return;
-      const box = button.getBoundingClientRect();
-      dragging = {
-        pointerId: event.pointerId,
-        grabX: event.clientX - box.left,
-        grabY: event.clientY - box.top,
-        fromX: event.clientX,
-        fromY: event.clientY,
-        moved: false
-      };
-      try { button.setPointerCapture(event.pointerId); } catch (_error) {}
-    }
-
-    function moveDrag(event) {
-      if (!dragging || event.pointerId !== dragging.pointerId) return;
-      if (!dragging.moved && Math.hypot(event.clientX - dragging.fromX, event.clientY - dragging.fromY) < DRAG_SLOP) return;
-      dragging.moved = true;
-      button.classList.add("dragging");
-      const size = button.offsetHeight || 44;
-      const width = root.innerWidth, height = root.innerHeight;
-      // Kept as numbers: where it lands is decided from these, not from a fresh layout
-      // read, which the browser is free to postpone until the pointer is already up.
-      dragging.left = Math.round(clamp(event.clientX - dragging.grabX, MARGIN, width - size - MARGIN));
-      dragging.top = Math.round(clamp(event.clientY - dragging.grabY, MARGIN, height - size - MARGIN));
-      dragging.size = size;
-      button.style.left = `${dragging.left}px`;
-      button.style.top = `${dragging.top}px`;
-      button.style.right = "auto";
-      event.preventDefault();
-    }
-
-    function endDrag(event) {
-      if (!dragging || event.pointerId !== dragging.pointerId) return;
-      const { moved, left = 0, top = 0, size = 44 } = dragging;
-      try { button.releasePointerCapture(dragging.pointerId); } catch (_error) {}
-      dragging = null;
-      button.classList.remove("dragging");
-      if (!moved) return;
-      // Dropped within reach of the left or right edge: snap flush to it, and remember the
-      // edge rather than the pixel, so it stays there whatever the window size. Dropped
-      // anywhere else: it stays exactly where it was put.
-      const width = root.innerWidth || 1;
-      if (left <= SNAP_MS) leftRatio = 0;
-      else if (left + size >= width - SNAP_MS) leftRatio = 1;
-      else leftRatio = clamp(left / width, 0, 1);
-      topRatio = clamp(top / (root.innerHeight || 1), 0, 1);
-      place();
-      post("settings-update", { floatingButtonLeft: leftRatio, floatingButtonTop: topRatio });
-    }
-
-    function mount() {
-      if (host?.isConnected) return;
-      host = document.createElement("div");
-      host.id = LAUNCHER_ID;
-      host.style.cssText = "all:initial!important;position:fixed!important;right:0!important;bottom:0!important;width:0!important;height:0!important;z-index:2147483645!important;";
-      const shadow = host.attachShadow({ mode: "open" });
-      const style = document.createElement("style");
-      style.textContent = LAUNCHER_CSS;
-      button = document.createElement("button");
-      button.type = "button";
-      button.className = "btr-launcher";
-      button.title = "线程撕裂者设置（可以拖动）";
-      button.setAttribute("aria-label", "线程撕裂者设置");
-      button.textContent = "BTR";
-      button.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        // A drag that ended on the button itself must not also open the panel.
-        if (button.dataset.dragged === "true") {
-          button.dataset.dragged = "";
-          return;
-        }
-        toggle();
-      });
-      button.addEventListener("pointerdown", startDrag);
-      button.addEventListener("pointermove", moveDrag);
-      for (const type of ["pointerup", "pointercancel"]) {
-        button.addEventListener(type, (event) => {
-          const moved = Boolean(dragging?.moved);
-          endDrag(event);
-          if (moved) button.dataset.dragged = "true";
-        });
-      }
-      shadow.append(style, button);
-      (document.body || document.documentElement).append(host);
-      place();
-    }
-
-    function apply() {
-      const show = wanted && !fullscreen() && !current;
-      if (!show) {
-        host?.remove();
-        return;
-      }
-      mount();
-      // Bilibili replaces large parts of the page when you navigate; put it back if it went.
-      if (!host.isConnected) (document.body || document.documentElement).append(host);
-      if (!dragging) place();
-    }
-
-    const update = (settings) => {
-      wanted = settings?.floatingButton !== false;
-      // null (never dragged) must stay null: Number(null) is 0, which would pin it to a corner.
-      const ratio = (value) => (value != null && Number(value) >= 0 && Number(value) <= 1 ? Number(value) : null);
-      leftRatio = ratio(settings?.floatingButtonLeft);
-      topRatio = ratio(settings?.floatingButtonTop);
-      apply();
-    };
-    for (const type of ["fullscreenchange", "webkitfullscreenchange"]) document.addEventListener(type, apply, true);
-    root.addEventListener("resize", apply);
-    // A page that swaps its body (the SPA navigations) drops the button with it.
-    setInterval(apply, 2000);
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply, { once: true });
-    // The button is on by default, so it is there before the stored settings arrive.
-    apply();
-    return { update, apply };
-  })();
-
-  root.addEventListener("message", (event) => {
-    if (event.source !== root || event.data?.channel !== CHANNEL) return;
-    if (event.data.type === "settings") {
-      latestSettings = core.normalizeSettings(event.data.payload);
-      launcher?.update(latestSettings);
-      current?.render(latestSettings);
-    } else if (event.data.type === "stats") {
-      latestStats = event.data.payload;
-    } else if (event.data.type === "open-settings" && root.top === root) {
-      // The toolbar icon toggles the panel; "自定义" in the gear menu only opens it.
-      if (event.data.payload?.toggle) toggle();
-      else open();
-    }
-  });
-  // The userscript manager's menu entry.
-  document.addEventListener("btr-userscript-open-settings", () => { if (root.top === root) toggle(); });
-
-  root.__BTR_SETTINGS_PANEL__ = Object.freeze({ open, close: () => current?.close(), toggle, isOpen: () => Boolean(current) });
 })(globalThis);
 
 /* src/page-hook.js */
@@ -5960,724 +5372,6 @@ const chrome = (() => {
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.4.2"
-    })
-  });
-  publish();
-})(globalThis);
-
-/* src/live-core.js */
-(function installLiveCore(root) {
-  "use strict";
-
-  // The parts of the live module that carry logic: playinfo parsing, playlist parsing,
-  // P2P/proxy URL handling and the host pool. No DOM and no timers, so dev tests can run
-  // all of it in Node.
-
-  // fMP4 HLS nodes that accept each other's signatures, verified by probing real streams
-  // (2026-09): a segment signed for one of them downloads from all of them with HTTP 206,
-  // while FLV-line (ov-gotcha07) and TS-line (gotcha105) nodes answer 403. The pool probes
-  // each candidate once per stream before trusting it.
-  const KNOWN_FMP4_HOSTS = Object.freeze([
-    "d1--cn-gotcha204.bilivideo.com",
-    "d1--cn-gotcha208.bilivideo.com",
-    "d1--ov-gotcha208.bilivideo.com",
-    "d1--ov-gotcha208b.bilivideo.com"
-  ]);
-
-  const LIVE_HOST_RE = /(?:^|\.)bilivideo\.(?:com|cn|net)$/i;
-  const P2P_HOST_RE = /(?:^|\.)(?:mcdn\.bilivideo\.(?:com|cn|net)|szbdyd\.com|nexusedgeio\.com|ahdohpiechei\.com)$/i;
-  // A stream URL wrapped in a commercial relay: https://xxx.smtcdns.net/d1--yy.bilivideo.com/...
-  const PROXY_WRAP_RE = /^(https?:)\/\/[\w.-]+\.smtcdns\.(?:net|com)\/([\w-]+\.bilivideo\.(?:com|cn|net))(\/.*)$/i;
-
-  function hostnameOf(value) {
-    try { return new URL(value).hostname.toLowerCase(); }
-    catch (_error) { return ""; }
-  }
-
-  function isLiveSegmentUrl(value) {
-    try {
-      const url = new URL(value);
-      return url.protocol === "https:" && LIVE_HOST_RE.test(url.hostname) && /\/live-bvc\//.test(url.pathname) && /\.m4s$/i.test(url.pathname);
-    } catch (_error) { return false; }
-  }
-
-  function isLivePlaylistUrl(value) {
-    try {
-      const url = new URL(value);
-      return url.protocol === "https:" && LIVE_HOST_RE.test(url.hostname) && /\.m3u8$/i.test(url.pathname);
-    } catch (_error) { return false; }
-  }
-
-  function isP2pUrl(value) {
-    const host = hostnameOf(value);
-    if (!host) return false;
-    return P2P_HOST_RE.test(host) || host.split(".")[0].includes("302");
-  }
-
-  // A smtcdns-wrapped URL unwraps to the official node it relays for; anything else
-  // returns "" and stays untouched.
-  function unwrapProxyUrl(value) {
-    const match = PROXY_WRAP_RE.exec(String(value || ""));
-    return match ? `${match[1]}//${match[2]}${match[3]}` : "";
-  }
-
-  // The playurl of getRoomPlayInfo, flattened to one entry per protocol/format/codec.
-  function parseRoomPlayInfo(payload) {
-    const playurl = payload?.data?.playurl_info?.playurl
-      || payload?.result?.playurl_info?.playurl
-      || payload?.playurl_info?.playurl;
-    const out = [];
-    for (const stream of playurl?.stream || []) {
-      for (const format of stream.format || []) {
-        for (const codec of format.codec || []) {
-          const urls = (codec.url_info || [])
-            .map((info) => ({ host: String(info?.host || ""), extra: String(info?.extra || "") }))
-            .filter((info) => info.host && !isP2pUrl(info.host));
-          if (!urls.length || !codec.base_url) continue;
-          out.push({
-            protocol: String(stream.protocol_name || ""),
-            format: String(format.format_name || ""),
-            codec: String(codec.codec_name || ""),
-            qn: Number(codec.current_qn) || 0,
-            acceptQn: Array.isArray(codec.accept_qn) ? codec.accept_qn.map(Number) : [],
-            baseUrl: String(codec.base_url),
-            urls
-          });
-        }
-      }
-    }
-    return out;
-  }
-
-  function segmentNumber(name) {
-    const match = /(\d+)\.m4s$/i.exec(String(name || ""));
-    return match ? Number(match[1]) : 0;
-  }
-
-  // A live media playlist. Segment URLs resolve against the playlist URL, so a playlist
-  // fetched from any node names segments on that same node.
-  function parseM3u8(text, playlistUrl) {
-    const lines = String(text || "").split(/\r?\n/);
-    const segments = [];
-    let mapUrl = "";
-    let duration = 0;
-    for (const line of lines) {
-      if (line.startsWith("#EXT-X-MAP")) {
-        const uri = /URI="([^"]+)"/.exec(line)?.[1];
-        if (uri) try { mapUrl = new URL(uri, playlistUrl).href; } catch (_error) {}
-        continue;
-      }
-      if (line.startsWith("#EXTINF")) {
-        duration = Number(/#EXTINF:([\d.]+)/.exec(line)?.[1]) || 0;
-        continue;
-      }
-      if (!line || line.startsWith("#")) continue;
-      try {
-        segments.push({ name: line.trim(), url: new URL(line.trim(), playlistUrl).href, num: segmentNumber(line), duration });
-      } catch (_error) {}
-      duration = 0;
-    }
-    return { mapUrl, segments, lastNum: segments.at(-1)?.num || 0 };
-  }
-
-  // Node health for one live stream. Live pieces are one second long, so the pool acts
-  // fast: it ranks by first-byte time, blocks a failing node briefly, and bans one that
-  // twice sent nothing. An unproven candidate must pass a probe before it enters ranking.
-  function createHostPool(options = {}) {
-    const health = new Map(); // host -> {fbMs, bps, failures, blockedUntil, lastSuccessAt, proven}
-    const now = () => (options.now ? options.now() : Date.now());
-
-    function entry(host) {
-      if (!health.has(host)) health.set(host, { fbMs: 0, bps: 0, failures: 0, blockedUntil: 0, lastSuccessAt: 0, proven: false, emptyReplies: 0, banned: false });
-      return health.get(host);
-    }
-
-    return Object.freeze({
-      add(host, proven = false) {
-        const item = entry(String(host || "").toLowerCase());
-        if (proven) item.proven = true;
-      },
-      success(host, fbMs, bps) {
-        const item = entry(host);
-        item.proven = true;
-        item.banned = false;
-        item.emptyReplies = 0;
-        item.failures = 0;
-        item.blockedUntil = 0;
-        item.lastSuccessAt = now();
-        if (Number(fbMs) > 0) item.fbMs = item.fbMs ? item.fbMs * 0.6 + fbMs * 0.4 : fbMs;
-        if (Number(bps) > 0) item.bps = item.bps ? item.bps * 0.6 + bps * 0.4 : bps;
-      },
-      failure(host, receivedBytes = 0) {
-        const item = entry(host);
-        item.failures += 1;
-        item.blockedUntil = now() + Math.min(20000, 1500 * (2 ** Math.min(item.failures, 3)));
-        if (Number(receivedBytes) <= 0) {
-          item.emptyReplies += 1;
-          if (item.emptyReplies >= 2 && !item.banned) {
-            item.banned = true;
-            try { options.onBan?.(host); } catch (_error) {}
-          }
-        }
-      },
-      // Ranked hosts: proven ones by first-byte speed, then unproven candidates. Blocked
-      // and banned hosts drop out unless nothing else is left.
-      pick(count = 3) {
-        const time = now();
-        const all = [...health.entries()];
-        const open = all.filter(([, item]) => !item.banned && item.blockedUntil <= time);
-        const pool = (open.length ? open : all.filter(([, item]) => !item.banned)).length
-          ? (open.length ? open : all.filter(([, item]) => !item.banned))
-          : all;
-        const ranked = pool.sort(([, a], [, b]) =>
-          Number(b.proven) - Number(a.proven)
-          || (a.fbMs || 9e9) - (b.fbMs || 9e9)
-          || (b.bps || 0) - (a.bps || 0));
-        return ranked.slice(0, Math.max(1, count)).map(([host]) => host);
-      },
-      unproven() {
-        return [...health.entries()].filter(([, item]) => !item.proven && !item.banned).map(([host]) => host);
-      },
-      status() {
-        const time = now();
-        return [...health.entries()].map(([host, item]) => ({
-          host,
-          state: item.banned ? "banned" : item.blockedUntil > time ? "blocked" : item.proven ? "healthy" : "untested",
-          bps: Math.round(item.bps || 0)
-        }));
-      }
-    });
-  }
-
-  root.__BILI_LIVE_CORE__ = Object.freeze({
-    KNOWN_FMP4_HOSTS,
-    createHostPool,
-    isLivePlaylistUrl,
-    isLiveSegmentUrl,
-    isP2pUrl,
-    parseM3u8,
-    parseRoomPlayInfo,
-    segmentNumber,
-    unwrapProxyUrl
-  });
-})(globalThis);
-
-/* src/live-hook.js */
-(function installLiveHook(root) {
-  "use strict";
-
-  // The live module: only the live site, and the userscript build loads every file on
-  // every bilibili page, so the hostname decides. The dev fixtures run on 127.0.0.1 and
-  // opt in explicitly.
-  if (!/^live\.bilibili\.com$/i.test(root.location?.hostname || "") && root.__BTR_TEST_ALLOW_LIVE__ !== true) return;
-
-  const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const INSTALL_FLAG = "__biliThreadRipperLiveInstalled";
-  const core = root.__BILI_LIVE_CORE__;
-  const rangeCore = root.__BILI_RANGE_CORE__;
-  const notices = root.__BTR_RUNTIME_NOTICES__;
-  if (!core || !rangeCore || typeof root.fetch !== "function" || root[INSTALL_FLAG]) return;
-  Object.defineProperty(root, INSTALL_FLAG, { value: true });
-
-  const nativeFetch = root.fetch.bind(root);
-  const HEDGE_MS = 400;
-  // A piece the player is actively waiting for hedges sooner: pieces are one second long
-  // and its own buffer is shallow.
-  const URGENT_HEDGE_MS = 150;
-  const FIRST_BYTE_TIMEOUT_MS = 2500;
-  const SEGMENT_TIMEOUT_MS = 8000;
-  const CACHE_LIMIT = 32;
-  const CACHE_TTL_MS = 45000;
-
-  let settings = rangeCore.normalizeSettings({});
-  let settingsLoaded = false;
-  // Off until the saved settings have arrived: a viewer who switched the module off must
-  // not be taken over during the first second of the page.
-  const liveOn = () => settingsLoaded && settings.enabled && settings.liveEnabled !== false;
-
-  // Bilibili's web player loads P2P SDKs that pull pieces from other viewers over WebRTC.
-  // Overseas there are few viewers nearby, so P2P only adds stalls; the mocks keep the
-  // player on the HTTP path. (Approach proven by Make-Bilibili-Great-Than-Ever-Before.)
-  // The page's own SDK is kept and handed out whenever the module is off.
-  class MockPcdn { on() {} off() {} emit() {} destroy() {} }
-  for (const name of ["PCDNLoader", "BPP2PSDK", "SeederSDK"]) {
-    let real = root[name];
-    try {
-      Object.defineProperty(root, name, {
-        configurable: true,
-        get() { return liveOn() ? MockPcdn : real; },
-        set(value) { real = value; }
-      });
-    } catch (_error) {}
-  }
-
-  // ---- stats for the extension badge and the settings panel ----
-  const stats = {
-    version: "0.9.4.2",
-    architecture: "live-segment-ripper",
-    mode: "live",
-    playerState: "waiting",
-    quality: "直播",
-    bufferedAhead: 0,
-    acceleratedRequests: 0,
-    acceleratedBytes: 0,
-    parallelSubrequests: 0,
-    activeThreads: 0,
-    totalSpeedBps: 0,
-    threadSpeeds: [],
-    discoveredCdns: 0,
-    healthyCdns: 0,
-    blockedCdns: 0,
-    cdnHosts: [],
-    lastHost: "",
-    lastError: "",
-    takeoverError: null
-  };
-  const activeTransfers = new Map();
-  let transferSequence = 1;
-  let publishTimer = null;
-  function publish() {
-    clearTimeout(publishTimer);
-    publishTimer = null;
-    const now = Date.now();
-    stats.activeThreads = activeTransfers.size;
-    stats.totalSpeedBps = Math.round([...activeTransfers.values()].reduce((sum, item) => now - item.at < 2000 ? sum + item.bps : sum, 0));
-    if (context) {
-      stats.cdnHosts = context.pool.status();
-      stats.discoveredCdns = stats.cdnHosts.length;
-      stats.healthyCdns = stats.cdnHosts.filter((item) => item.state === "healthy").length;
-      stats.blockedCdns = stats.cdnHosts.filter((item) => ["blocked", "banned"].includes(item.state)).length;
-    }
-    root.postMessage({ channel: CHANNEL, type: "stats", payload: { ...stats } }, "*");
-  }
-  function schedulePublish() {
-    if (!publishTimer) publishTimer = setTimeout(publish, 250);
-  }
-
-  // ---- one live stream: the playlist currently being played ----
-  // context: { key, playlistUrl, pool, cache: Map(url -> {promise, at, hit}), lastNum, mapUrl, probing }
-  let context = null;
-  // The stream the player asked for most recently. A playlist answer that arrives late,
-  // after the player moved on to another stream, must not bring the old one back.
-  let latestPlaylistKey = "";
-
-  const swapHost = (url, host) => { const u = new URL(url); u.hostname = host; u.port = ""; return u.href; };
-  // Everything of a stream stops with it: queued prefetches, running downloads, probes.
-  function dropContext() {
-    if (!context) return;
-    context.prefetchQueue.length = 0;
-    context.abort.abort(new DOMException("直播已切换或加速已关闭", "AbortError"));
-    context = null;
-  }
-  const directoryOf = (url) => { try { const u = new URL(url); return u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1); } catch (_error) { return ""; } };
-
-  function contextFor(playlistUrl) {
-    const key = directoryOf(playlistUrl);
-    if (context?.key === key) {
-      context.playlistUrl = playlistUrl;
-      return context;
-    }
-    dropContext();
-    const pool = core.createHostPool({
-      onBan(host) { notices?.log("已停用一个直播节点", `${host} 两次没有返回数据，这个直播接下来不再使用它。`, "error", "", "live", "download"); }
-    });
-    let origin = "";
-    try { origin = new URL(playlistUrl).hostname; } catch (_error) {}
-    // The node Bilibili handed out is trusted unless it is a P2P relay. In the custom CDN
-    // mode only the servers the viewer picked join it; otherwise the known fMP4 group does.
-    if (origin && !core.isP2pUrl(playlistUrl)) pool.add(origin, true);
-    const extra = settings.mode === "custom" ? settings.customHosts : core.KNOWN_FMP4_HOSTS;
-    for (const host of extra) if (host !== origin) pool.add(host, false);
-    context = { key, playlistUrl, pool, cache: new Map(), lastNum: 0, mapUrl: "", probing: false, speculativeMisses: 0, prefetchQueue: [], inflightPrefetch: 0, urgentInflight: 0, abort: new AbortController() };
-    stats.playerState = "ready";
-    notices?.log("已接管这个直播", "直播分片改为多节点竞速下载，并提前缓存即将播放的分片。", "success", "", "live", "takeover");
-    schedulePublish();
-    return context;
-  }
-
-  // Candidate nodes must prove they serve this stream before ranking uses them: the
-  // signature is shared within the fMP4 node group, but a node may still lack the stream.
-  function probeCandidates(ctx, sampleUrl) {
-    if (ctx.probing) return;
-    const unproven = ctx.pool.unproven();
-    if (!unproven.length) return;
-    ctx.probing = true;
-    Promise.allSettled(unproven.map(async (host) => {
-      const startedAt = performance.now();
-      try {
-        const probe = new AbortController();
-        const probeTimer = setTimeout(() => probe.abort(new DOMException("直播节点探测超时", "TimeoutError")), 4000);
-        const dropProbe = () => probe.abort(ctx.abort.signal.reason);
-        ctx.abort.signal.addEventListener("abort", dropProbe, { once: true });
-        let response;
-        let body;
-        try {
-          response = await nativeFetch(swapHost(sampleUrl, host), {
-            headers: { Range: "bytes=0-2047" },
-            credentials: "omit",
-            cache: "no-store",
-            signal: probe.signal
-          });
-          body = new Uint8Array(await response.arrayBuffer());
-        } finally {
-          clearTimeout(probeTimer);
-          ctx.abort.signal.removeEventListener("abort", dropProbe);
-        }
-        if ((response.status === 206 || response.status === 200) && body.byteLength > 0) {
-          ctx.pool.success(host, performance.now() - startedAt, 0);
-        } else {
-          ctx.pool.failure(host, body.byteLength);
-        }
-      } catch (_error) {
-        ctx.pool.failure(host, 0);
-      }
-    })).then(() => {
-      ctx.probing = false;
-      schedulePublish();
-    });
-  }
-
-  async function attemptSegment(ctx, url, host, signal) {
-    const startedAt = performance.now();
-    const transferId = transferSequence++;
-    activeTransfers.set(transferId, { at: Date.now(), bps: 0 });
-    schedulePublish();
-    let received = 0;
-    try {
-      const response = await nativeFetch(swapHost(url, host), {
-        credentials: "omit",
-        cache: "no-store",
-        signal
-      });
-      if (response.status !== 200 && response.status !== 206) {
-        throw Object.assign(new Error(`直播分片响应异常：HTTP ${response.status}`), { status: response.status });
-      }
-      // Nothing here asks for a range, so a 206 is only acceptable when it covers the file.
-      const contentRange = rangeCore.parseContentRange(response.headers.get("content-range"));
-      if (response.status === 206 && (!contentRange || contentRange.start !== 0 || contentRange.total === null || contentRange.end !== contentRange.total - 1)) {
-        throw new Error("直播分片只返回了一部分");
-      }
-      const reader = response.body?.getReader?.();
-      const chunks = [];
-      let firstByteMs = 0;
-      if (reader) {
-        const firstByteTimer = setTimeout(() => reader.cancel(new DOMException("直播分片首字节超时", "TimeoutError")).catch(() => {}), FIRST_BYTE_TIMEOUT_MS);
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!firstByteMs) {
-            firstByteMs = performance.now() - startedAt;
-            clearTimeout(firstByteTimer);
-          }
-          chunks.push(value);
-          received += value.byteLength;
-          const item = activeTransfers.get(transferId);
-          if (item) item.bps = received * 1000 / Math.max(1, performance.now() - startedAt);
-        }
-        clearTimeout(firstByteTimer);
-      } else {
-        const body = new Uint8Array(await response.arrayBuffer());
-        firstByteMs = performance.now() - startedAt;
-        chunks.push(body);
-        received = body.byteLength;
-      }
-      if (signal?.aborted) throw new DOMException("已取消", "AbortError");
-      if (received <= 0) throw new Error("直播分片为空");
-      const declared = response.status === 206 ? contentRange.total : Number(response.headers.get("content-length"));
-      if (Number.isFinite(declared) && declared > 0 && received !== declared) throw new Error(`直播分片长度不对：收到 ${received}，应为 ${declared}`);
-      const bytes = new Uint8Array(received);
-      let offset = 0;
-      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-      const elapsed = Math.max(1, performance.now() - startedAt);
-      ctx.pool.success(host, firstByteMs || elapsed, received * 1000 / elapsed);
-      stats.lastHost = host;
-      return { bytes, contentType: response.headers.get("content-type") || "video/iso.segment", host };
-    } catch (error) {
-      if (error?.name !== "AbortError" && Number(error?.status) !== 404) ctx.pool.failure(host, received);
-      throw error;
-    } finally {
-      activeTransfers.delete(transferId);
-      schedulePublish();
-    }
-  }
-
-  // One segment: the best node first, a hedge copy on the second-best when the first is
-  // slow to produce bytes. 404 means "not born yet" for a speculative fetch and is not a
-  // node failure.
-  async function downloadSegment(ctx, url, { speculative = false, urgent = false } = {}) {
-    const hosts = ctx.pool.pick(2);
-    if (!hosts.length) throw new Error("没有可用直播节点");
-    const controllers = hosts.map(() => new AbortController());
-    const dropped = () => controllers.forEach((c) => { if (!c.signal.aborted) c.abort(ctx.abort.signal.reason); });
-    if (ctx.abort.signal.aborted) dropped();
-    else ctx.abort.signal.addEventListener("abort", dropped, { once: true });
-    const overall = setTimeout(() => controllers.forEach((c) => c.abort(new DOMException("直播分片总超时", "TimeoutError"))), SEGMENT_TIMEOUT_MS);
-    let primaryFailed = () => {};
-    const primaryFailure = new Promise((resolve) => { primaryFailed = resolve; });
-    try {
-      const attempts = hosts.map((host, index) => (async () => {
-        if (index) {
-          await new Promise((resolve) => {
-            const timer = setTimeout(resolve, speculative ? HEDGE_MS * 3 : urgent ? URGENT_HEDGE_MS : HEDGE_MS);
-            primaryFailure.then(() => { clearTimeout(timer); resolve(); });
-          });
-          if (controllers[index].signal.aborted) throw new DOMException("已取消", "AbortError");
-        }
-        try {
-          return await attemptSegment(ctx, url, host, controllers[index].signal);
-        } catch (error) {
-          if (!index) primaryFailed();
-          throw error;
-        }
-      })());
-      const winner = await Promise.any(attempts);
-      controllers.forEach((controller) => { if (!controller.signal.aborted) controller.abort(new DOMException("并发副本已取消", "AbortError")); });
-      return winner;
-    } catch (aggregate) {
-      throw aggregate?.errors?.at?.(-1) || aggregate;
-    } finally {
-      clearTimeout(overall);
-      ctx.abort.signal.removeEventListener("abort", dropped);
-    }
-  }
-
-  function pruneCache(ctx) {
-    const now = Date.now();
-    for (const [key, item] of ctx.cache) {
-      if (key === ctx.mapUrl) continue;
-      if (now - item.at > CACHE_TTL_MS) ctx.cache.delete(key);
-    }
-    while (ctx.cache.size > CACHE_LIMIT) {
-      const oldest = [...ctx.cache.keys()].find((key) => key !== ctx.mapUrl);
-      if (!oldest) break;
-      ctx.cache.delete(oldest);
-    }
-  }
-
-  function cacheSegment(ctx, url, options = {}) {
-    let item = ctx.cache.get(url);
-    if (item) return item;
-    item = { at: Date.now(), hit: false, promise: downloadSegment(ctx, url, options) };
-    item.promise.catch(() => { if (ctx.cache.get(url) === item) ctx.cache.delete(url); });
-    ctx.cache.set(url, item);
-    pruneCache(ctx);
-    return item;
-  }
-
-  // Prefetch runs through a small queue instead of all at once: the first playlist would
-  // otherwise burst eight segments that compete for bandwidth with the very segment the
-  // player is waiting for, which is exactly when its shallow buffer runs dry. While the
-  // player waits for a segment (urgent), the queue nearly stops.
-  function pumpPrefetch(ctx) {
-    while (ctx.inflightPrefetch < (ctx.urgentInflight > 0 ? 1 : 3) && ctx.prefetchQueue.length) {
-      const next = ctx.prefetchQueue.shift();
-      if (ctx.cache.has(next.url)) continue;
-      ctx.inflightPrefetch += 1;
-      const item = cacheSegment(ctx, next.url, next.options);
-      const done = (ok) => {
-        try { next.options.onSettled?.(ok); } catch (_error) {}
-        ctx.inflightPrefetch = Math.max(0, ctx.inflightPrefetch - 1);
-        pumpPrefetch(ctx);
-      };
-      item.promise.then(() => done(true), () => done(false));
-    }
-  }
-
-  function enqueuePrefetch(ctx, url, options = {}) {
-    if (ctx.cache.has(url) || ctx.prefetchQueue.some((entry) => entry.url === url)) return;
-    ctx.prefetchQueue.push({ url, options });
-    if (ctx.prefetchQueue.length > 16) ctx.prefetchQueue.shift();
-    pumpPrefetch(ctx);
-  }
-
-  // What a new playlist drives: prefetch the announced-but-uncached tail, the init map,
-  // and — once everything announced is in hand — one speculative future segment, whose
-  // 404 only means the encoder has not produced it yet.
-  function onPlaylist(playlistUrl, text, requestedKey) {
-    if (!liveOn() || requestedKey !== latestPlaylistKey) return;
-    // Only fMP4 media playlists: a master playlist or a TS stream is not the module's business.
-    if (/#EXT-X-STREAM-INF/.test(text) || !/#EXT-X-MAP/.test(text)) return;
-    const parsed = core.parseM3u8(text, playlistUrl);
-    if (!parsed.segments.length || !parsed.segments.every((segment) => /\.m4s$/i.test(segment.name))) return;
-    const ctx = contextFor(playlistUrl);
-    ctx.lastNum = Math.max(ctx.lastNum, parsed.lastNum);
-    if (parsed.mapUrl) {
-      ctx.mapUrl = parsed.mapUrl;
-      // The init segment is tiny and everything needs it: fetched at once, outside the queue.
-      if (!ctx.cache.has(parsed.mapUrl)) cacheSegment(ctx, parsed.mapUrl);
-    }
-    probeCandidates(ctx, parsed.segments[0].url);
-    // The whole announced window, not just the newest pieces: the player usually plays a
-    // few seconds behind the live edge, and a piece it is about to ask for must already
-    // be in hand — a cache miss there costs a fresh download against its shallow buffer.
-    // Oldest first: that is the order the player will consume them in.
-    let pending = 0;
-    for (const segment of parsed.segments) {
-      if (!ctx.cache.has(segment.url)) {
-        enqueuePrefetch(ctx, segment.url);
-        pending += 1;
-      }
-    }
-    if (!pending && parsed.lastNum > 0 && ctx.speculativeMisses < 6) {
-      const last = parsed.segments.at(-1);
-      const nextUrl = last.url.replace(`${last.num}.m4s`, `${last.num + 1}.m4s`);
-      if (!ctx.cache.has(nextUrl)) {
-        enqueuePrefetch(ctx, nextUrl, {
-          speculative: true,
-          onSettled: (ok) => { ctx.speculativeMisses = ok ? 0 : ctx.speculativeMisses + 1; }
-        });
-      }
-    }
-    stats.bufferedAhead = parsed.segments.filter((segment) => ctx.cache.get(segment.url)).length;
-    schedulePublish();
-  }
-
-  async function serveSegment(url, input, init) {
-    const ctx = context;
-    const signal = init?.signal || (input instanceof Request ? input.signal : null);
-    if (signal?.aborted) throw signal.reason || new DOMException("已取消", "AbortError");
-    const cached = ctx?.cache.get(url);
-    const item = cached || (ctx && directoryOf(url) === ctx.key ? cacheSegment(ctx, url, { urgent: true }) : null);
-    if (!item) return nativeFetch(input, init);
-    // While the player waits here, the prefetch queue slows to a trickle so the waited-for
-    // segment gets the bandwidth.
-    if (!cached && ctx) ctx.urgentInflight += 1;
-    let stopWaiting = () => {};
-    try {
-      // The download goes on for the cache; only this caller stops waiting.
-      const result = await (signal ? Promise.race([item.promise, new Promise((_resolve, reject) => {
-        stopWaiting = () => reject(signal.reason || new DOMException("已取消", "AbortError"));
-        signal.addEventListener("abort", stopWaiting, { once: true });
-      })]) : item.promise);
-      if (!item.hit) {
-        item.hit = true;
-        stats.acceleratedRequests += 1;
-        stats.acceleratedBytes += result.bytes.byteLength;
-        schedulePublish();
-      }
-      const response = new Response(result.bytes.slice(), {
-        status: 200,
-        headers: { "Content-Type": result.contentType, "Content-Length": String(result.bytes.byteLength) }
-      });
-      try { Object.defineProperty(response, "url", { value: url }); } catch (_error) {}
-      return response;
-    } catch (error) {
-      if (error?.name === "AbortError") throw error;
-      stats.lastError = String(error?.message || error).slice(0, 160);
-      notices?.log("直播分片下载失败", `${stats.lastError}\n这一片交回给 B 站原来的连接。`, "error", "seg-fallback", "live", "download");
-      schedulePublish();
-      return nativeFetch(input, init);
-    } finally {
-      signal?.removeEventListener("abort", stopWaiting);
-      if (!cached && ctx) {
-        ctx.urgentInflight = Math.max(0, ctx.urgentInflight - 1);
-        pumpPrefetch(ctx);
-      }
-    }
-  }
-
-  // A request whose URL was rewritten keeps everything else the player gave it: headers,
-  // credentials, signal, cache mode.
-  function withUrl(input, url) {
-    if (!(input instanceof Request)) return url;
-    try { return new Request(url, input); } catch (_error) { return url; }
-  }
-
-  // P2P and relay-wrapped URLs route back to the best official node; without a pool yet,
-  // an smtcdns wrapper at least unwraps to the node it fronts.
-  function rewriteUrl(url) {
-    const unwrapped = core.unwrapProxyUrl(url) || url;
-    if (!core.isP2pUrl(unwrapped)) return unwrapped;
-    if (context && (core.isLiveSegmentUrl(unwrapped) || /\.m4s(?:\?|$)/i.test(unwrapped))) {
-      const best = context.pool.pick(1)[0];
-      if (best) try { return swapHost(unwrapped, best); } catch (_error) {}
-    }
-    return unwrapped;
-  }
-
-  root.fetch = function (input, init) {
-    let url = "";
-    try { url = input instanceof Request ? input.url : String(input); } catch (_error) {}
-    if (!liveOn() || !url) return nativeFetch(input, init);
-    const method = String(init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
-    if (method !== "GET") return nativeFetch(input, init);
-    const rewritten = rewriteUrl(url);
-    if (core.isLivePlaylistUrl(rewritten)) {
-      const requestedKey = directoryOf(rewritten);
-      latestPlaylistKey = requestedKey;
-      const pending = nativeFetch(rewritten === url ? input : withUrl(input, rewritten), init);
-      pending.then((response) => {
-        response.clone().text().then((text) => onPlaylist(response.url || rewritten, text, requestedKey)).catch(() => {});
-      }).catch(() => {});
-      return pending;
-    }
-    let ranged = false;
-    try { ranged = Boolean((init?.headers && new Headers(init.headers).get("range")) || (input instanceof Request && input.headers.get("range"))); } catch (_error) {}
-    if (core.isLiveSegmentUrl(rewritten) && !ranged) {
-      return serveSegment(rewritten, rewritten === url ? input : withUrl(input, rewritten), init);
-    }
-    if (rewritten !== url) return nativeFetch(withUrl(input, rewritten), init);
-    return nativeFetch(input, init);
-  };
-
-  // A player that loads media over XMLHttpRequest gets the URL rewrite (P2P removal and
-  // best-node routing); synthesizing full XHR responses is not worth the risk here.
-  const xhrPrototype = root.XMLHttpRequest?.prototype;
-  if (xhrPrototype) {
-    const nativeOpen = xhrPrototype.open;
-    xhrPrototype.open = function (method, url, ...rest) {
-      let target = url;
-      try {
-        if (liveOn() && String(method).toUpperCase() === "GET") {
-          const value = String(url || "");
-          const rewritten = rewriteUrl(value);
-          if (rewritten !== value) target = rewritten;
-          else if (core.isLiveSegmentUrl(value) && context) {
-            const best = context.pool.pick(1)[0];
-            const origin = new URL(value).hostname;
-            if (best && best !== origin && context.pool.status().find((item) => item.host === origin)?.state === "banned") {
-              target = swapHost(value, best);
-            }
-          }
-        }
-      } catch (_error) { target = url; }
-      return nativeOpen.call(this, method, target, ...rest);
-    };
-  }
-
-  root.addEventListener("message", (event) => {
-    if (event.source !== root || event.data?.channel !== CHANNEL) return;
-    if (event.data.type === "settings") {
-      const previous = settings;
-      settings = rangeCore.normalizeSettings(event.data.payload);
-      notices?.configure(settings);
-      if (!settingsLoaded || previous.enabled !== settings.enabled || previous.liveEnabled !== settings.liveEnabled) {
-        settingsLoaded = true;
-        notices?.log("直播加速设置已生效", liveOn() ? "直播分片使用多节点竞速下载。" : "直播加速已关闭，使用 B 站原来的连接。", "success", "", "live", "settings");
-      }
-      if (!liveOn()) {
-        dropContext();
-        stats.playerState = "disabled";
-      } else if (previous.mode !== settings.mode || previous.customHosts.join() !== settings.customHosts.join()) {
-        // A new CDN choice means a new node pool; the next playlist builds it.
-        dropContext();
-      }
-      publish();
-    } else if (event.data.type === "get-stats") {
-      publish();
-    }
-  });
-
-  Object.defineProperty(root, "__biliThreadRipperLiveDebug", {
-    value: Object.freeze({
-      getContext: () => context && {
-        key: context.key,
-        lastNum: context.lastNum,
-        cached: context.cache.size,
-        hosts: context.pool.status()
-      },
-      getStats: () => ({ ...stats }),
       version: "0.9.4.2"
     })
   });
